@@ -6,6 +6,7 @@ use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use axel_i18n::t;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
     EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -35,12 +36,14 @@ pub fn run(deps: Deps, initial: Screen) -> Result<Outcome> {
     // Mouse capture: without it the terminal turns the wheel into ↑/↓ on the
     // alternate screen, which the composer reads as prompt history.
     // Focus reports: the recent-threads pane only highlights its row while it has focus.
+    // Each is a nicety (paste, wheel, focus); the TUI still works without them.
     let _ = execute!(stdout(), EnableBracketedPaste, EnableMouseCapture, EnableFocusChange);
     // Shift+Enter in the thread view's composer is a line break.
     let keys = crate::util::enhance_keys();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         crate::util::restore_keys(keys);
+        // Already panicking: restore what we can and let the hook report.
         let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture, DisableFocusChange);
         ratatui::restore();
         previous_hook(info);
@@ -49,10 +52,21 @@ pub fn run(deps: Deps, initial: Screen) -> Result<Outcome> {
     let result = event_loop(&mut terminal, &deps, &owner_pk, initial);
 
     crate::util::restore_keys(keys);
+    // Teardown: keep restoring the terminal even if this step fails.
     let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
+    // Drop our terminal-restoring hook (it owns the previous one); the default is back.
     let _ = std::panic::take_hook();
     result
+}
+
+/// A list for the launcher, or an empty one and the error to show in its
+/// header: the launcher still works without its suggestions.
+fn or_empty<T>(loaded: Result<Vec<T>>) -> (Vec<T>, Option<String>) {
+    match loaded {
+        Ok(list) => (list, None),
+        Err(e) => (Vec::new(), Some(format!("couldn't read the store: {e}"))),
+    }
 }
 
 struct App<'a> {
@@ -80,6 +94,8 @@ struct App<'a> {
 impl<'a> App<'a> {
     fn new(deps: &'a Deps<'a>, owner_pk: &'a str, initial: Screen) -> Self {
         let now = now_secs();
+        // Start empty on a load error: opening the screen refreshes it, and
+        // the refresh shows the error in the screen's flash line.
         let dashboard = Dashboard::new(glue::load_dashboard(deps.store, owner_pk, now).unwrap_or_default());
         let inbox = Inbox::new(glue::load_inbox(deps.store, owner_pk).unwrap_or_default());
         let launcher = Self::fresh_launcher(deps);
@@ -106,11 +122,12 @@ impl<'a> App<'a> {
     }
 
     fn fresh_launcher(deps: &Deps) -> Launcher {
-        let projects = glue::load_projects(deps.store).unwrap_or_default();
-        let agents = glue::load_agents(deps.store).unwrap_or_default();
+        let (projects, projects_error) = or_empty(glue::load_projects(deps.store));
+        let (agents, agents_error) = or_empty(glue::load_agents(deps.store));
         let harnesses = deps.harnesses.iter().map(|h| h.to_string()).collect();
         let mut l = Launcher::new(deps.cwd.clone(), projects, agents, harnesses);
         l.pane_grows = deps.fit_prompt.is_some();
+        l.error = projects_error.or(agents_error);
         l
     }
 
@@ -122,15 +139,19 @@ impl<'a> App<'a> {
                 if self.launcher.spawn.is_some() {
                     self.launcher = Self::fresh_launcher(self.deps);
                 } else {
-                    let projects = glue::load_projects(self.deps.store).unwrap_or_default();
-                    let agents = glue::load_agents(self.deps.store).unwrap_or_default();
+                    let (projects, projects_error) = or_empty(glue::load_projects(self.deps.store));
+                    let (agents, agents_error) = or_empty(glue::load_agents(self.deps.store));
                     self.launcher.set_projects(projects);
                     self.launcher.set_agents(agents);
+                    if let Some(error) = projects_error.or(agents_error) {
+                        self.launcher.error = Some(error);
+                    }
                 }
             }
             Screen::Thread(tid) => {
                 let same = self.thread.as_ref().is_some_and(|t| &t.thread_id == tid);
                 if !same {
+                    // Start empty on a load error: the refresh below shows it in the status line.
                     let data = glue::load_thread(self.deps.store, self.owner_pk, tid, now_secs()).unwrap_or_default();
                     self.thread = Some(ThreadView::new(tid, data));
                 }
@@ -174,7 +195,7 @@ impl<'a> App<'a> {
                 if let Some(t) = self.thread.as_mut() {
                     match glue::load_thread(self.deps.store, self.owner_pk, tid, now) {
                         Ok(d) => t.set_data(d),
-                        Err(e) => t.set_status(format!("error: refresh failed: {e}")),
+                        Err(e) => t.set_error(t!("error: refresh failed: {error}", error = e)),
                     }
                 }
             }
@@ -248,34 +269,7 @@ impl<'a> App<'a> {
     fn handle(&mut self, ev: Event) -> Option<Outcome> {
         crate::util::log_key(&ev);
         match ev {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match &self.screen {
-                Screen::Dashboard => {
-                    let action = self.dashboard.handle_key(key, now_secs());
-                    self.on_dashboard(action)
-                }
-                Screen::Launcher => {
-                    let action = self.launcher.handle_key(key);
-                    let out = self.on_launcher(action);
-                    self.sync_runtime_label();
-                    self.fit_prompt();
-                    out
-                }
-                Screen::Inbox => {
-                    let action = self.inbox.handle_key(key);
-                    self.on_inbox(action)
-                }
-                Screen::Thread(_) => {
-                    let action = self.thread.as_mut().map(|t| t.handle_key(key)).unwrap_or(ThreadAction::Back);
-                    self.on_thread(action)
-                }
-                Screen::Threads => {
-                    self.focused = true;
-                    let action = self.picker.handle_key(key);
-                    self.on_picker(action)
-                }
-                // Nothing to pick: Esc or q closes it.
-                Screen::Usage => matches!(key.code, KeyCode::Esc | KeyCode::Char('q')).then_some(Outcome::Quit),
-            },
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::FocusGained => {
                 self.focused = true;
                 None
@@ -284,50 +278,86 @@ impl<'a> App<'a> {
                 self.focused = false;
                 None
             }
-            Event::Mouse(m) => {
-                let delta = match m.kind {
-                    MouseEventKind::ScrollUp => -3,
-                    MouseEventKind::ScrollDown => 3,
-                    _ => return None,
-                };
-                match &self.screen {
-                    Screen::Thread(_) => {
-                        if let Some(t) = self.thread.as_mut() {
-                            t.scroll(delta);
-                        }
-                        None
-                    }
-                    // The wheel only moves the cursor here; ↑ on the first row would leave the pane.
-                    Screen::Threads => {
-                        let code = if delta < 0 { KeyCode::Up } else { KeyCode::Down };
-                        if !(code == KeyCode::Up && self.picker.sel == 0) {
-                            self.picker.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
-                        }
-                        None
-                    }
-                    // Lists elsewhere: the wheel moves the selection, one row per notch.
-                    _ => {
-                        let code = if delta < 0 { KeyCode::Up } else { KeyCode::Down };
-                        self.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-                    }
-                }
-            }
+            Event::Mouse(m) => self.handle_mouse(m.kind),
             Event::Paste(text) => {
-                match &self.screen {
-                    Screen::Launcher => {
-                        self.launcher.handle_paste(&text);
-                        self.fit_prompt();
-                    }
-                    Screen::Thread(_) => {
-                        if let Some(t) = self.thread.as_mut() {
-                            t.handle_paste(&text);
-                        }
-                    }
-                    _ => {}
-                }
+                self.handle_paste(&text);
                 None
             }
             _ => None,
+        }
+    }
+
+    /// A key, to the screen that has it.
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        match &self.screen {
+            Screen::Dashboard => {
+                let action = self.dashboard.handle_key(key, now_secs());
+                self.on_dashboard(action)
+            }
+            Screen::Launcher => {
+                let action = self.launcher.handle_key(key);
+                let out = self.on_launcher(action);
+                self.sync_runtime_label();
+                self.fit_prompt();
+                out
+            }
+            Screen::Inbox => {
+                let action = self.inbox.handle_key(key);
+                self.on_inbox(action)
+            }
+            Screen::Thread(_) => {
+                let action = self.thread.as_mut().map(|t| t.handle_key(key)).unwrap_or(ThreadAction::Back);
+                self.on_thread(action)
+            }
+            Screen::Threads => {
+                self.focused = true;
+                let action = self.picker.handle_key(key);
+                self.on_picker(action)
+            }
+            // Nothing to pick: Esc or q closes it.
+            Screen::Usage => matches!(key.code, KeyCode::Esc | KeyCode::Char('q')).then_some(Outcome::Quit),
+        }
+    }
+
+    /// The wheel: scrolls the thread, moves the selection in lists.
+    fn handle_mouse(&mut self, kind: MouseEventKind) -> Option<Outcome> {
+        let delta = match kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            _ => return None,
+        };
+        let code = if delta < 0 { KeyCode::Up } else { KeyCode::Down };
+        match &self.screen {
+            Screen::Thread(_) => {
+                if let Some(t) = self.thread.as_mut() {
+                    t.scroll(delta);
+                }
+                None
+            }
+            // The wheel only moves the cursor here; ↑ on the first row would leave the pane.
+            Screen::Threads => {
+                if !(code == KeyCode::Up && self.picker.sel == 0) {
+                    self.picker.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                }
+                None
+            }
+            // Lists elsewhere: the wheel moves the selection, one row per notch.
+            _ => self.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        match &self.screen {
+            Screen::Launcher => {
+                self.launcher.handle_paste(text);
+                self.fit_prompt();
+            }
+            Screen::Thread(_) => {
+                if let Some(t) = self.thread.as_mut() {
+                    t.handle_paste(text);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -344,6 +374,7 @@ impl<'a> App<'a> {
                 None
             }
             DashAction::OpenThread(tid) => {
+                // Showing it outside this TUI is a preference: on any error, open it here instead.
                 let opened = self.deps.open_thread.is_some_and(|f| f(&tid).is_ok());
                 if !opened {
                     self.open(Screen::Thread(tid));
@@ -352,9 +383,10 @@ impl<'a> App<'a> {
             }
             DashAction::FocusSession(sid) => Some(Outcome::FocusSession(sid)),
             DashAction::Spawn { thread_id, title } => {
-                let agents = glue::load_agents(self.deps.store).unwrap_or_default();
+                let (agents, agents_error) = or_empty(glue::load_agents(self.deps.store));
                 let harnesses = self.deps.harnesses.iter().map(|h| h.to_string()).collect();
                 self.launcher = Launcher::for_spawn(self.deps.cwd.clone(), agents, harnesses, &thread_id, &title);
+                self.launcher.error = agents_error;
                 self.screen = Screen::Launcher;
                 None
             }
@@ -440,13 +472,12 @@ impl<'a> App<'a> {
                 if let Some(manage) = self.deps.manage_thread {
                     self.picker.notice = Some(match manage(&tid, op) {
                         Ok(()) => {
-                            let done = match op {
-                                crate::ThreadOp::Settle => "Settled",
-                                crate::ThreadOp::Reopen => "Reopened",
-                                crate::ThreadOp::Archive => "Archived",
-                                crate::ThreadOp::Delete => "Deleted",
-                            };
-                            format!("{done} “{title}”")
+                            match op {
+                                crate::ThreadOp::Settle => t!("Settled “{title}”", title = title),
+                                crate::ThreadOp::Reopen => t!("Reopened “{title}”", title = title),
+                                crate::ThreadOp::Archive => t!("Archived “{title}”", title = title),
+                                crate::ThreadOp::Delete => t!("Deleted “{title}”", title = title),
+                            }
                         }
                         Err(e) => format!("{e:#}"),
                     });
@@ -455,6 +486,7 @@ impl<'a> App<'a> {
                 None
             }
             PickAction::Open(tid) => {
+                // Showing it outside this TUI is a preference: on any error, open it here instead.
                 let opened = self.deps.open_thread.is_some_and(|f| f(&tid).is_ok());
                 if !opened {
                     self.open(Screen::Thread(tid));
@@ -481,19 +513,23 @@ impl<'a> App<'a> {
             InboxAction::Allow(req) | InboxAction::Deny(req) => {
                 match glue::reply_permission(self.deps.store, self.deps.keystore, &req, allow) {
                     Ok(()) => self.inbox.set_flash(
-                        format!("{} {}'s request", if allow { "Allowed" } else { "Denied" }, req.agent_name),
+                        if allow {
+                            t!("Allowed {agent}'s request", agent = req.agent_name)
+                        } else {
+                            t!("Denied {agent}'s request", agent = req.agent_name)
+                        },
                         now,
                     ),
-                    Err(e) => self.inbox.set_flash(format!("reply failed: {e:#}"), now),
+                    Err(e) => self.inbox.set_flash(t!("reply failed: {error}", error = format!("{e:#}")), now),
                 }
                 self.refresh(true);
                 None
             }
             InboxAction::MarkRead => {
                 match glue::mark_all_read(self.deps.store, self.owner_pk, &self.inbox.data) {
-                    Ok(true) => self.inbox.set_flash("Marked all read", now),
-                    Ok(false) => self.inbox.set_flash("Nothing to mark", now),
-                    Err(e) => self.inbox.set_flash(format!("mark read failed: {e:#}"), now),
+                    Ok(true) => self.inbox.set_flash(t!("Marked all read"), now),
+                    Ok(false) => self.inbox.set_flash(t!("Nothing to mark"), now),
+                    Err(e) => self.inbox.set_flash(t!("mark read failed: {error}", error = format!("{e:#}")), now),
                 }
                 self.refresh(true);
                 None

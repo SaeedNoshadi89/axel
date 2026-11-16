@@ -28,11 +28,12 @@ pub fn slugify(title: &str) -> String {
         }
     }
 
-    const MAX: usize = 40;
-    if out.chars().count() > MAX {
-        let cut: String = out.chars().take(MAX).collect();
+    // Branch names stay readable in a terminal tab and a `git branch` list at 40.
+    const SLUG_CHARS_MAX: usize = 40;
+    if out.chars().count() > SLUG_CHARS_MAX {
+        let cut: String = out.chars().take(SLUG_CHARS_MAX).collect();
         out = match cut.rfind('-') {
-            Some(idx) if idx >= MAX / 2 => cut[..idx].to_string(),
+            Some(idx) if idx >= SLUG_CHARS_MAX / 2 => cut[..idx].to_string(),
             _ => cut,
         };
     }
@@ -45,24 +46,24 @@ pub fn slugify(title: &str) -> String {
 /// Both arguments are Unix seconds. Timestamps in the future (clock skew) are
 /// reported as `"just now"`.
 pub fn relative_time(ts_secs: i64, now_secs: i64) -> String {
+    use axel_i18n::t;
     let delta = now_secs.saturating_sub(ts_secs);
     if delta < 60 {
-        return "just now".to_string();
+        return t!("just now").to_string();
     }
-    let (n, unit) = if delta < 3600 {
-        (delta / 60, "m")
+    if delta < 3600 {
+        t!("{n}m ago", n = delta / 60)
     } else if delta < 86_400 {
-        (delta / 3600, "h")
+        t!("{n}h ago", n = delta / 3600)
     } else if delta < 7 * 86_400 {
-        (delta / 86_400, "d")
+        t!("{n}d ago", n = delta / 86_400)
     } else if delta < 30 * 86_400 {
-        (delta / (7 * 86_400), "w")
+        t!("{n}w ago", n = delta / (7 * 86_400))
     } else if delta < 365 * 86_400 {
-        (delta / (30 * 86_400), "mo")
+        t!("{n}mo ago", n = delta / (30 * 86_400))
     } else {
-        (delta / (365 * 86_400), "y")
-    };
-    format!("{n}{unit} ago")
+        t!("{n}y ago", n = delta / (365 * 86_400))
+    }
 }
 
 /// Current Unix time in seconds.
@@ -102,25 +103,78 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<u32> {
         if let Some(prev) = last_hit
             && idx == prev + 1
         {
-            score += 10;
+            score = score.saturating_add(10);
         }
         last_hit = Some(idx);
     }
     Some(score)
 }
 
-/// Truncate `s` to at most `max` characters, appending `…` when cut.
+/// A count of terminal cells or rows as ratatui's `u16`, saturating: no
+/// terminal is 65 535 cells wide, so a larger count only means "all of it".
+pub(crate) fn cells(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// The cells `c` takes in a terminal: 2 for CJK, 0 for a combining mark or
+/// a control character.
+pub fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// The cells `s` takes in a terminal.
+pub fn text_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Truncate `s` to at most `max` terminal cells, ending in `…` when cut. A
+/// wide character is never split: when it would straddle the edge it goes,
+/// and the ellipsis keeps a cell of its own.
 pub fn ellipsize(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
+    if text_width(s) <= max {
         return s.to_string();
     }
     if max == 0 {
         return String::new();
     }
-    let mut out: String = s.chars().take(max - 1).collect();
+    let room = max - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = char_width(c);
+        if used + w > room {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('…');
+    debug_assert!(text_width(&out) <= max, "an ellipsized text fits its room");
     out
+}
+
+/// The longest start of `s` that fits in `max` cells, never half a wide character.
+pub fn fit_width(s: &str, max: usize) -> &str {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        let w = char_width(c);
+        if used + w > max {
+            return &s[..i];
+        }
+        used += w;
+    }
+    s
+}
+
+/// `s` and spaces after it to fill `width` cells (`{:<width$}` counts
+/// characters, which leaves a CJK column short).
+pub fn pad_end(s: &str, width: usize) -> String {
+    format!("{s}{}", " ".repeat(width.saturating_sub(text_width(s))))
+}
+
+/// Spaces, then `s`, to fill `width` cells: a right-aligned column.
+pub fn pad_start(s: &str, width: usize) -> String {
+    format!("{}{s}", " ".repeat(width.saturating_sub(text_width(s))))
 }
 
 /// Compact token count: `950`, `12.4k`, `1.2M`.
@@ -205,6 +259,7 @@ pub fn log_key(ev: &crossterm::event::Event) {
     }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("keys.log")) {
+        // A debugging aid: a key the log misses must not disturb the TUI.
         let _ = writeln!(f, "{} {ev:?}", chrono::Local::now().format("%H:%M:%S%.3f"));
     }
 }
@@ -212,6 +267,7 @@ pub fn log_key(ev: &crossterm::event::Event) {
 /// Undo [`enhance_keys`].
 pub fn restore_keys(enhanced: bool) {
     if enhanced {
+        // Teardown: a terminal that won't take the pop is already gone or ours no longer.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
     }
 }
@@ -478,6 +534,27 @@ mod tests {
         assert_eq!(ellipsize("hello", 10), "hello");
         assert_eq!(ellipsize("hello world", 5), "hell…");
         assert_eq!(ellipsize("hello", 0), "");
+    }
+
+    #[test]
+    fn ellipsize_counts_cells_and_never_splits_a_wide_character() {
+        // Six characters, twelve cells.
+        assert_eq!(ellipsize("修复登录错误", 12), "修复登录错误");
+        assert_eq!(ellipsize("修复登录错误", 11), "修复登录错…");
+        // Five cells: two characters (4) and the ellipsis, not half a third.
+        assert_eq!(ellipsize("修复登录错误", 5), "修复…");
+        assert_eq!(ellipsize("修复登录错误", 4), "修…");
+        assert_eq!(ellipsize("修复登录错误", 2), "…");
+        assert_eq!(ellipsize("修复登录错误", 1), "…");
+        assert_eq!(ellipsize("ab修复", 4), "ab…");
+        for max in 0..14 {
+            assert!(text_width(&ellipsize("修复 the 登录 bug", max)) <= max, "{max}");
+        }
+        assert_eq!(fit_width("ab修复", 3), "ab");
+        assert_eq!(fit_width("ab修复", 4), "ab修");
+        assert_eq!(pad_end("修复", 6), "修复  ");
+        assert_eq!(pad_start("修复", 5), " 修复");
+        assert_eq!(pad_end("修复登录", 2), "修复登录", "too wide: left as it is");
     }
 
     #[test]

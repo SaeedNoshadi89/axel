@@ -5,7 +5,7 @@
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::Value;
 
-use crate::{ConversationItem, Error, ItemKind, ItemStatus, NewItem, Store, new_id};
+use crate::{ConversationItem, Error, ItemKind, ItemStatus, NewItem, Store, new_id, sql_limit};
 
 pub(crate) const ITEM_COLS: &str =
     "id, session_id, thread_id, seq, turn, at, kind, status, ref_id, content_json";
@@ -52,6 +52,7 @@ impl Store {
             [&item.session_id],
             |r| r.get(0),
         )?;
+        assert!(seq >= 1, "item seq counts from 1");
         let out = ConversationItem {
             id: new_id(),
             session_id: item.session_id.clone(),
@@ -182,7 +183,7 @@ impl Store {
         let mut st = self.conn.prepare(&format!(
             "SELECT {ITEM_COLS} FROM conversation_items WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3"
         ))?;
-        let rows = st.query_map(params![session_id, after_seq, limit as i64], row_item)?;
+        let rows = st.query_map(params![session_id, after_seq, sql_limit(limit)], row_item)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -199,7 +200,7 @@ impl Store {
                  ORDER BY at DESC, seq DESC, session_id DESC LIMIT ?2)
              ORDER BY at ASC, seq ASC, session_id ASC"
         ))?;
-        let rows = st.query_map(params![thread_id, limit as i64], row_item)?;
+        let rows = st.query_map(params![thread_id, sql_limit(limit)], row_item)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

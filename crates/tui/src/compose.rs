@@ -8,6 +8,7 @@ use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use axel_i18n::t;
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
 use ratatui::Frame;
@@ -18,7 +19,7 @@ use ratatui::widgets::Paragraph;
 use crate::Deps;
 use crate::glue;
 use crate::thread::{Row, ThreadAction, ThreadView};
-use crate::util::now_secs;
+use crate::util::{cells, now_secs};
 use crate::view::thread_view::{composer_height, queue_height, render_composer, render_queue, row_lines};
 
 const POLL: Duration = Duration::from_millis(60);
@@ -49,6 +50,7 @@ pub fn run_compose(deps: Deps, thread_id: &str, fit: &dyn Fn(u16, u16), on_quest
     ask_new(&v);
 
     let mut terminal = ratatui::init();
+    // Without bracketed paste a paste arrives as keys: worse, but still usable.
     let _ = execute!(stdout(), EnableBracketedPaste);
     // Tell Shift+Enter (a line break) apart from Enter (send).
     let keys = crate::util::enhance_keys();
@@ -71,32 +73,12 @@ pub fn run_compose(deps: Deps, thread_id: &str, fit: &dyn Fn(u16, u16), on_quest
                 crate::util::log_key(&ev);
                 match ev {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        match v.handle_compose_key(key) {
-                            ThreadAction::None => {}
-                            ThreadAction::OpenLog(session_id) => toggle_log(&session_id),
-                            ThreadAction::Quit | ThreadAction::Back => return Ok(()),
-                            ThreadAction::Send { session_id, cmd } => {
-                                let reply = (deps.send)(&session_id, cmd).map_err(|e| format!("{e:#}"));
-                                v.on_reply(reply);
-                                last = Instant::now() - REFRESH;
-                            }
-                            ThreadAction::Summon { thread_id, agent, text, attachments } => {
-                                let reply = (deps.summon)(&thread_id, &agent, &text, &attachments).map_err(|e| format!("{e:#}"));
-                                v.on_reply(reply.map(|_| crate::thread::SendReply::Ok));
-                                last = Instant::now() - REFRESH;
-                            }
-                            ThreadAction::Manage => {
-                                if let Some(open) = deps.open_controls {
-                                    open(thread_id);
-                                }
-                            }
-                            ThreadAction::OpenTerminal => {
-                                if let Some(open) = deps.open_terminal
-                                    && let Err(e) = open(thread_id)
-                                {
-                                    v.on_reply(Err(format!("could not open terminal: {e:#}")));
-                                }
-                            }
+                        let action = v.handle_compose_key(key);
+                        match carry_out(&deps, thread_id, &mut v, action, toggle_log) {
+                            Next::Wait => {}
+                            // What was sent shows sooner.
+                            Next::Refresh => last = Instant::now() - REFRESH,
+                            Next::Quit => return Ok(()),
                         }
                     }
                     Event::Paste(text) => v.handle_paste(&text),
@@ -104,9 +86,13 @@ pub fn run_compose(deps: Deps, thread_id: &str, fit: &dyn Fn(u16, u16), on_quest
                 }
             }
             if last.elapsed() >= REFRESH {
-                if let Ok(d) = glue::load_thread(deps.store, &owner_pk, thread_id, now_secs()) {
-                    v.set_data(d);
-                    ask_new(&v);
+                match glue::load_thread(deps.store, &owner_pk, thread_id, now_secs()) {
+                    Ok(d) => {
+                        v.set_data(d);
+                        ask_new(&v);
+                    }
+                    // As the thread screen does: the next refresh tries again.
+                    Err(e) => v.set_error(t!("error: refresh failed: {error}", error = e)),
                 }
                 // Settled (or archived, deleted) elsewhere, e.g. from the
                 // dashboard: the thread's window goes, as when you leave it.
@@ -118,11 +104,54 @@ pub fn run_compose(deps: Deps, thread_id: &str, fit: &dyn Fn(u16, u16), on_quest
         }
     })();
     crate::util::restore_keys(keys);
+    // Teardown: keep restoring the terminal even if this step fails.
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
 
+/// What the composer's loop does after an action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    Wait,
+    /// Something was sent: read the thread again now.
+    Refresh,
+    Quit,
+}
+
+/// Carry out what a key asked for.
+fn carry_out(deps: &Deps, thread_id: &str, v: &mut ThreadView, action: ThreadAction, toggle_log: &dyn Fn(&str)) -> Next {
+    match action {
+        ThreadAction::None => {}
+        ThreadAction::OpenLog(session_id) => toggle_log(&session_id),
+        ThreadAction::Quit | ThreadAction::Back => return Next::Quit,
+        ThreadAction::Send { session_id, cmd } => {
+            let reply = (deps.send)(&session_id, cmd).map_err(|e| format!("{e:#}"));
+            v.on_reply(reply);
+            return Next::Refresh;
+        }
+        ThreadAction::Summon { thread_id, agent, text, attachments } => {
+            let reply = (deps.summon)(&thread_id, &agent, &text, &attachments).map_err(|e| format!("{e:#}"));
+            v.on_reply(reply.map(|_| crate::thread::SendReply::Ok));
+            return Next::Refresh;
+        }
+        ThreadAction::Manage => {
+            if let Some(open) = deps.open_controls {
+                open(thread_id);
+            }
+        }
+        ThreadAction::OpenTerminal => {
+            if let Some(open) = deps.open_terminal
+                && let Err(e) = open(thread_id)
+            {
+                v.on_reply(Err(format!("could not open terminal: {e:#}")));
+            }
+        }
+    }
+    Next::Wait
+}
+
+/// `None` when the thread is gone or can't be read; the next poll reads it again.
 fn thread_state(deps: &Deps, thread_id: &str) -> Option<axel_store::ThreadState> {
     deps.store.get_thread(thread_id).ok().flatten().map(|t| t.state)
 }
@@ -248,8 +277,10 @@ fn render_answer(frame: &mut Frame, v: &ThreadView) {
     lines.pop();
     lines.push(Line::from(""));
     let hint=if let crate::model::ItemBody::Choice {multiple:Some((min,max)),..}=v.data.items[i].body {
-        format!("↑↓ move · Space toggle · Enter confirm · {min}–{max} picks · Esc later")
-    } else {"↑↓ pick · Enter or 1–9 answer · Esc answer later in the composer".into()};
+        t!("↑↓ move · Space toggle · Enter confirm · {min}–{max} picks · Esc later", min = min, max = max)
+    } else {
+        t!("↑↓ pick · Enter or 1–9 answer · Esc answer later in the composer").into()
+    };
     lines.push(Line::styled(hint, crate::theme::dim()));
     if let Some(st) = &v.status {
         lines.push(Line::styled(st.clone(), crate::theme::dim()));
@@ -303,7 +334,7 @@ impl PaneFit {
 pub fn desired_height(v: &ThreadView, width: u16) -> u16 {
     // `composer_height` picks its text rows from the area height; ask as a tall pane.
     let composer = composer_height(v, Rect::new(0, 0, width, 40));
-    let card = v.pending_choice().map_or(0, |i| row_lines(v, &Row::Choice(i), width.saturating_sub(1) as usize, true).len() as u16);
+    let card = v.pending_choice().map_or(0, |i| cells(row_lines(v, &Row::Choice(i), width.saturating_sub(1) as usize, true).len()));
     composer + queue_height(v) + card
 }
 
@@ -316,7 +347,7 @@ pub fn render(frame: &mut Frame, v: &ThreadView) {
         Some(i) => row_lines(v, &Row::Choice(i), area.width.saturating_sub(1) as usize, true),
         None => Vec::new(),
     };
-    let card_h = (card.len() as u16).min(area.height.saturating_sub(composer_h + queue_h));
+    let card_h = cells(card.len()).min(area.height.saturating_sub(composer_h + queue_h));
     let [_, card_area, queue_area, composer_area] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(card_h),

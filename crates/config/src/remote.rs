@@ -19,7 +19,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, GitHubSkills, SKILL_FILE, Skill, SkillSource, WorkspaceConfig};
+use crate::{Error, GitHubSkills, SKILL_FILE, Skill, SkillSource, WorkspaceConfig, config::read_text};
+
+/// How many directories deep [`skill_files`] looks into a checkout. Skill repos put a
+/// skill two or three levels down (`skills/<name>/SKILL.md`,
+/// `.claude/skills/<name>/SKILL.md`); 16 is far past that and still a fixed bound.
+const CHECKOUT_DEPTH_MAX: usize = 16;
 
 /// File name of the lock, next to `AXEL.md`.
 pub const AXEL_LOCK: &str = "AXEL.lock";
@@ -37,7 +42,7 @@ impl Lock {
     /// Read `dir/AXEL.lock`; empty when it doesn't exist.
     pub fn load(dir: &Path) -> Result<Lock, Error> {
         let path = dir.join(AXEL_LOCK);
-        match fs::read_to_string(&path) {
+        match read_text(&path) {
             Ok(text) if text.trim().is_empty() => Ok(Lock::default()),
             Ok(text) => serde_norway::from_str(&text).map_err(|e| Error::from(e).at(&path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Lock::default()),
@@ -101,11 +106,17 @@ impl Fetcher {
     fn fetch(&self, g: &GitHubSkills, what: &str) -> Result<(String, PathBuf), Error> {
         let parent = self.repo_dir(g);
         fs::create_dir_all(&parent).map_err(|e| Error::io(&parent, e))?;
+        // Only has to differ from other fetches in flight: the pid tells processes
+        // apart, the clock fetches within one (a clock before 1970 still gives a pid).
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let tmp = parent.join(format!(".fetch-{}-{nanos}", std::process::id()));
+        // git takes the path as text; an empty one would init the current directory.
+        let tmp_text = tmp
+            .to_str()
+            .ok_or_else(|| Error::Git(format!("the skills cache path {} is not UTF-8", tmp.display())))?;
         let result = (|| {
             let url = format!("{}/{}/{}.git", self.base_url, g.owner, g.repo);
-            git(None, &["init", "-q", tmp.to_str().unwrap_or_default()])?;
+            git(None, &["init", "-q", tmp_text])?;
             git(Some(&tmp), &["fetch", "-q", "--depth", "1", &url, what]).map_err(|e| match e {
                 Error::Git(msg) => Error::Git(format!("can't fetch {url}: {msg}")),
                 other => other,
@@ -115,6 +126,8 @@ impl Fetcher {
             fs::remove_dir_all(tmp.join(".git")).map_err(|e| Error::io(&tmp, e))?;
             let dest = parent.join(&commit);
             if dest.is_dir() {
+                // Another fetch got the same commit first; ours is a duplicate. A
+                // leftover `.fetch-*` directory is never read as a checkout.
                 let _ = fs::remove_dir_all(&tmp);
             } else {
                 fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
@@ -122,6 +135,7 @@ impl Fetcher {
             Ok((commit, dest))
         })();
         if result.is_err() {
+            // Best effort: the fetch's own error is what the caller needs.
             let _ = fs::remove_dir_all(&tmp);
         }
         result
@@ -158,7 +172,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, Error> {
 /// are a repo's own tooling, so they count only when nothing else matches.
 pub fn skill_files(checkout: &Path, skill: Option<&str>) -> Vec<PathBuf> {
     let mut all = Vec::new();
-    walk(checkout, &mut all);
+    walk(checkout, 0, &mut all);
     let hidden = |p: &Path| {
         p.strip_prefix(checkout).unwrap_or(p).components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
     };
@@ -186,17 +200,23 @@ pub fn skill_files(checkout: &Path, skill: Option<&str>) -> Vec<PathBuf> {
     files
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Collect the `SKILL.md` files under `dir`, at most [`CHECKOUT_DEPTH_MAX`] levels
+/// down. Directory symlinks are not followed: a checkout is someone else's tree, and
+/// a link to `/` or back to its own parent would walk the whole disk or never end.
+/// An entry that can't be read is skipped; the walk is a best-effort search.
+fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut entries: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-    entries.sort();
-    for path in entries {
+    let mut entries: Vec<(PathBuf, fs::FileType)> =
+        entries.filter_map(|e| e.ok()).filter_map(|e| Some((e.path(), e.file_type().ok()?))).collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, file_type) in entries {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if path.is_dir() {
-            if name != ".git" && name != "node_modules" {
-                walk(&path, out);
+        // `DirEntry::file_type` doesn't follow symlinks, so a linked directory isn't one.
+        if file_type.is_dir() {
+            if name != ".git" && name != "node_modules" && depth < CHECKOUT_DEPTH_MAX {
+                walk(&path, depth + 1, out);
             }
-        } else if name == SKILL_FILE {
+        } else if name == SKILL_FILE && !path.is_dir() {
             out.push(path);
         }
     }
@@ -284,10 +304,19 @@ pub struct Update {
 /// Fetch every remote source's ref and report those that moved. Nothing is changed:
 /// apply an update by setting `lock.skills[source.key()] = to` and saving.
 pub fn check_updates(config: &WorkspaceConfig, cache: &Path) -> (Lock, Vec<Update>, Vec<String>) {
-    let lock = config.dir().map(|d| Lock::load(d).unwrap_or_default()).unwrap_or_default();
+    let mut errors = Vec::new();
+    // A lock that can't be read is reported and treated as empty, as `resolve` does:
+    // every source then shows as an update from no pin.
+    let lock = match config.dir().map(Lock::load) {
+        Some(Ok(lock)) => lock,
+        Some(Err(e)) => {
+            errors.push(format!("{e}; ignoring it"));
+            Lock::default()
+        }
+        None => Lock::default(),
+    };
     let fetcher = Fetcher::new(cache);
     let mut updates = Vec::new();
-    let mut errors = Vec::new();
     let skill_dirs = |dir: &Path, g: &GitHubSkills| -> Vec<PathBuf> {
         skill_files(dir, g.skill.as_deref()).iter().filter_map(|f| f.parent().map(Path::to_path_buf)).collect()
     };
@@ -295,7 +324,16 @@ pub fn check_updates(config: &WorkspaceConfig, cache: &Path) -> (Lock, Vec<Updat
         let from = lock.skills.get(&g.key()).cloned();
         match fetcher.latest(g) {
             Ok((to, dir)) if from.as_deref() != Some(to.as_str()) => {
-                let old = from.as_deref().and_then(|c| fetcher.checkout(g, c).ok()).map(|d| skill_dirs(&d, g)).unwrap_or_default();
+                // Without the pinned checkout the update still stands; it just can't
+                // show what the skills were.
+                let old = match from.as_deref().map(|commit| fetcher.checkout(g, commit)) {
+                    Some(Ok(old_dir)) => skill_dirs(&old_dir, g),
+                    Some(Err(e)) => {
+                        errors.push(format!("{g}: can't show the pinned skills: {e}"));
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
                 updates.push(Update { source: g.clone(), from, to, old, new: skill_dirs(&dir, g) });
             }
             Ok(_) => {}
@@ -355,6 +393,30 @@ mod tests {
         assert_eq!(names(skill_files(c, Some("internal"))), [".agents/skills/internal/SKILL.md"], "hidden only as a fallback");
         assert!(skill_files(c, Some("nope")).is_empty());
         assert_eq!(names(skill_files(c, None)).len(), 3, "a whole repo leaves out hidden dirs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_stays_inside_the_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside/secret");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join(SKILL_FILE), "# not this repo's\n").unwrap();
+        let c = root.path().join("checkout");
+        fs::create_dir_all(c.join("skills/real")).unwrap();
+        fs::write(c.join("skills/real").join(SKILL_FILE), "# real\n").unwrap();
+        // A link out of the checkout, and two back into it (a loop that branches).
+        std::os::unix::fs::symlink(root.path().join("outside"), c.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&c, c.join("skills/loop-a")).unwrap();
+        std::os::unix::fs::symlink(&c, c.join("skills/loop-b")).unwrap();
+        let found: Vec<String> = skill_files(&c, None).iter().map(|p| p.strip_prefix(&c).unwrap().display().to_string()).collect();
+        assert_eq!(found, ["skills/real/SKILL.md"]);
+
+        // Deeper than the limit is not searched.
+        let deep: PathBuf = std::iter::repeat_n("d", CHECKOUT_DEPTH_MAX + 1).collect();
+        fs::create_dir_all(c.join(&deep)).unwrap();
+        fs::write(c.join(&deep).join(SKILL_FILE), "# too deep\n").unwrap();
+        assert_eq!(skill_files(&c, None).len(), 1);
     }
 
     #[test]

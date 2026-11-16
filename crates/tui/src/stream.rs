@@ -11,6 +11,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Result;
+use axel_i18n::t;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -57,98 +58,136 @@ pub fn run_stream(store: &axel_store::Store, owner_pk: &str, thread_id: &str, re
     let mut width = WidthWatch::default();
     // Each agent's state, as OSC 7501 records of this pane: the agents' own
     // panes are minimized, so this is where Rex (and its Activity) sees them.
-    let mut reported: Vec<AgentRecord> = Vec::new();
-    let mut root_reported: Option<String> = None;
+    let mut reports = Reported::default();
     loop {
-        let now = agent_records(&view.data);
-        let reports = status_reports(&reported, &now);
-        if !reports.is_empty() {
-            // An agent finished, or stopped to wait for you: the bell, as
-            // Claude Code rings it (Rex plays its sound).
-            if chime(&reported, &now) {
-                out.write_all(b"\x07")?;
-            }
-            out.write_all(reports.as_bytes())?;
-            reported = now;
-        }
-        // The thread as a whole, in the record with no id: what the tab shows.
-        let root = root_report(&view.data.title, &reported);
-        if root_reported.as_ref() != Some(&root) {
-            out.write_all(root.as_bytes())?;
-            root_reported = Some(root);
-        }
-        let (w, h) = crossterm::terminal::size().unwrap_or((100, 40));
-        // Everything is wrapped to the pane's width once, when printed: print
-        // only at a settled width, and when it settles on another, print it
-        // all again (the old lines, and the tail redrawn over them, wouldn't fit).
-        // A pane grown shorter (the composer took rows) than the live tail it
-        // shows can't redraw that tail in place: the cursor can't climb past
-        // the top. Print it all again, as for a new width.
-        let tail_overflows = !s.tail_fits(h);
-        let print = match width.on_tick(w) {
-            Width::Same if tail_overflows => {
-                write!(out, "\x1b[H\x1b[2J\x1b[3J{}\r\n", to_ansi(&header_line(&view)))?;
-                s.forget();
-                true
-            }
-            Width::Wait => false,
-            Width::First => {
-                // The pane starts with the login banner (`Last login: …`): clear it.
-                write!(out, "\x1b[H\x1b[2J\x1b[3J{}\r\n", to_ansi(&header_line(&view)))?;
-                true
-            }
-            Width::Reprint => {
-                write!(out, "\x1b[H\x1b[2J\x1b[3J{}\r\n", to_ansi(&header_line(&view)))?;
-                s.forget();
-                true
-            }
-            Width::Same => true,
-        };
-        if print {
-            let frame = s.frame(&view, w as usize, h as usize);
-            if !frame.is_empty() {
-                out.write_all(frame.as_bytes())?;
-            }
-        }
+        reports.write(&mut out, &view)?;
+        print_tick(&mut out, &mut s, &mut width, &view)?;
         out.flush()?;
         if let Some(redirect) = redirect_input {
-            let deadline = std::time::Instant::now() + TICK;
-            while let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) {
-                if !event::poll(wait)? {
-                    break;
-                }
-                let mut text = String::new();
-                // The first event, then any input already queued behind it.
-                let mut first = true;
-                while first || event::poll(Duration::ZERO)? {
-                    first = false;
-                    let ev = event::read()?;
-                    if is_ctrl(&ev, 'c') {
-                        return Ok(());
-                    }
-                    match shortcut(&ev) {
-                        Some(sc) => {
-                            // Text typed before the shortcut goes first.
-                            if !text.is_empty() {
-                                redirect(StreamInput::Text(std::mem::take(&mut text)))?;
-                            }
-                            redirect(sc)?;
-                        }
-                        None => text.extend(typed_text(ev)),
-                    }
-                }
-                if !text.is_empty() {
-                    redirect(StreamInput::Text(text))?;
-                }
+            if forward_input(redirect)? == Forwarded::Quit {
+                return Ok(());
             }
         } else {
             std::thread::sleep(TICK);
         }
         s.tick += 1;
+        // A failed read keeps the thread as last read; the next tick reads it again.
         if let Ok(d) = glue::load_thread(store, owner_pk, thread_id, now_secs()) {
             view.set_data(d);
         }
     }
+}
+
+/// What this pane last reported to Rex: each agent's record, and the thread's.
+#[derive(Default)]
+struct Reported {
+    agents: Vec<AgentRecord>,
+    root: Option<String>,
+}
+
+impl Reported {
+    /// Write the records that changed since the last tick.
+    fn write(&mut self, out: &mut impl Write, view: &ThreadView) -> Result<()> {
+        let now = agent_records(&view.data);
+        let reports = status_reports(&self.agents, &now);
+        if !reports.is_empty() {
+            // An agent finished, or stopped to wait for you: the bell, as
+            // Claude Code rings it (Rex plays its sound).
+            if chime(&self.agents, &now) {
+                out.write_all(b"\x07")?;
+            }
+            out.write_all(reports.as_bytes())?;
+            self.agents = now;
+        }
+        // The thread as a whole, in the record with no id: what the tab shows.
+        let root = root_report(&view.data.title, &self.agents);
+        if self.root.as_ref() != Some(&root) {
+            out.write_all(root.as_bytes())?;
+            self.root = Some(root);
+        }
+        Ok(())
+    }
+}
+
+/// Print what changed this tick, at the pane's current size.
+fn print_tick(out: &mut impl Write, s: &mut Stream, width: &mut WidthWatch, view: &ThreadView) -> Result<()> {
+    // A terminal that can't say its size gets a common one.
+    let (w, h) = crossterm::terminal::size().unwrap_or((100, 40));
+    // Everything is wrapped to the pane's width once, when printed: print
+    // only at a settled width, and when it settles on another, print it
+    // all again (the old lines, and the tail redrawn over them, wouldn't fit).
+    // A pane grown shorter (the composer took rows) than the live tail it
+    // shows can't redraw that tail in place: the cursor can't climb past
+    // the top. Print it all again, as for a new width.
+    let tail_overflows = !s.tail_fits(h);
+    let print = match width.on_tick(w) {
+        Width::Same if tail_overflows => {
+            write!(out, "\x1b[H\x1b[2J\x1b[3J{}\r\n", to_ansi(&header_line(view)))?;
+            s.forget();
+            true
+        }
+        Width::Wait => false,
+        Width::First => {
+            // The pane starts with the login banner (`Last login: …`): clear it.
+            write!(out, "\x1b[H\x1b[2J\x1b[3J{}\r\n", to_ansi(&header_line(view)))?;
+            true
+        }
+        Width::Reprint => {
+            write!(out, "\x1b[H\x1b[2J\x1b[3J{}\r\n", to_ansi(&header_line(view)))?;
+            s.forget();
+            true
+        }
+        Width::Same => true,
+    };
+    if print {
+        let frame = s.frame(view, w as usize, h as usize);
+        if !frame.is_empty() {
+            out.write_all(frame.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the stream goes on after its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Forwarded {
+    Continue,
+    /// ^C: close the stream.
+    Quit,
+}
+
+/// Forward what is typed for one tick: runs of text together, shortcuts on their own.
+fn forward_input(redirect: &RedirectInputFn<'_>) -> Result<Forwarded> {
+    let deadline = std::time::Instant::now() + TICK;
+    while let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if !event::poll(wait)? {
+            break;
+        }
+        let mut text = String::new();
+        // The first event, then any input already queued behind it.
+        let mut first = true;
+        while first || event::poll(Duration::ZERO)? {
+            first = false;
+            let ev = event::read()?;
+            if is_ctrl(&ev, 'c') {
+                return Ok(Forwarded::Quit);
+            }
+            match shortcut(&ev) {
+                Some(sc) => {
+                    // Text typed before the shortcut goes first.
+                    if !text.is_empty() {
+                        redirect(StreamInput::Text(std::mem::take(&mut text)))?;
+                    }
+                    redirect(sc)?;
+                }
+                None => text.extend(typed_text(ev)),
+            }
+        }
+        if !text.is_empty() {
+            redirect(StreamInput::Text(text))?;
+        }
+    }
+    Ok(Forwarded::Continue)
 }
 
 /// Read text immediately without echo, leaving scrollback and selection alone.
@@ -165,6 +204,7 @@ impl RawInput {
 
 impl Drop for RawInput {
     fn drop(&mut self) {
+        // Teardown can't report: a terminal that refuses these is already gone.
         let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste, crossterm::cursor::Show);
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -465,11 +505,11 @@ impl Stream {
         }
         let mut live: Vec<String> = live_rows.iter().flat_map(|r| self.row_ansi(v, r, width)).collect();
         if working {
-            let who = v.data.agents.iter().find(|a| a.2 == crate::model::StatusState::Working).map(|a| a.0.clone()).unwrap_or_else(|| "agent".into());
+            let who = v.data.agents.iter().find(|a| a.2 == crate::model::StatusState::Working).map(|a| a.0.clone()).unwrap_or_else(|| t!("agent").into());
             let frame = SPINNER[self.tick % SPINNER.len()];
             live.push(to_ansi(&Line::from(vec![
                 Span::styled(format!("{frame} "), theme::accent()),
-                Span::styled(format!("{who} is working…"), theme::dim()),
+                Span::styled(t!("{who} is working…", who = who), theme::dim()),
             ])));
         }
         // Never draw a tail taller than the pane: cursor-up can't go past the
@@ -600,14 +640,14 @@ fn render_row(v: &ThreadView, row: &Row, width: usize) -> Vec<Line<'static>> {
         if it.status == Some(ItemStatus::Pending)
             && let ItemBody::Choice { prompt, options, .. } = &it.body
         {
-            let who = it.agent.as_ref().map(|(n, _)| n.clone()).unwrap_or_else(|| "agent".into());
-            let (glyph, verb, color) = match it.kind {
-                ItemKind::Permission => ("!", "asks permission", theme::DANGER),
-                _ => ("?", "asks", Color::Yellow),
+            let who = it.agent.as_ref().map(|(n, _)| n.clone()).unwrap_or_else(|| t!("agent").into());
+            let (glyph, color) = match it.kind {
+                ItemKind::Permission => ("!", theme::DANGER),
+                _ => ("?", Color::Yellow),
             };
             let opts: Vec<String> = options.iter().enumerate().map(|(n, o)| format!("{} {}", n + 1, o.label)).collect();
-            let mut lines = crate::view::thread_view::question_header(glyph, color, &who, verb, prompt, width);
-            lines.push(Line::from(Span::styled(format!("    {} · answer below", opts.join("  ")), theme::dim())));
+            let mut lines = crate::view::thread_view::question_header(glyph, color, it.kind, &who, prompt, width);
+            lines.push(Line::from(Span::styled(format!("    {}", t!("{options} · answer below", options = opts.join("  "))), theme::dim())));
             return lines;
         }
     }

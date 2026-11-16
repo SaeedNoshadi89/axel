@@ -1,3 +1,4 @@
+use axel_i18n::t;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -7,6 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{DiffView, Draft, Layout, LineKind, Side, paint};
 use crate::theme;
+use crate::util::cells;
 
 struct Row {
     file: usize,
@@ -46,7 +48,7 @@ fn sidebar(frame: &mut Frame, v: &mut DiffView, area: Rect) {
     for i in v.file_order() {
         let file = &v.data.files[i];
         if grouped && !file.authored && !others {
-            rows.push((None, Line::from(plain("also changed", width, Style::default().fg(v.palette.muted)))));
+            rows.push((None, Line::from(plain(t!("also changed"), width, Style::default().fg(v.palette.muted)))));
             others = true;
             parent.clear();
         }
@@ -71,8 +73,8 @@ fn sidebar(frame: &mut Frame, v: &mut DiffView, area: Rect) {
     let selected = rows.iter().position(|(i, _)| *i == Some(v.file)).unwrap_or(0);
     let first = selected.saturating_sub(area.height.saturating_sub(3) as usize);
     for (n, (file, line)) in rows.into_iter().skip(first).take(area.height as usize).enumerate() {
-        draw(frame, area.x + 1, area.y + n as u16, area.width.saturating_sub(2), line);
-        if let Some(i) = file { v.hits.push((Rect::new(area.x, area.y + n as u16, area.width.saturating_sub(1), 1), super::Hit::File(i))); }
+        draw(frame, area.x + 1, area.y + cells(n), area.width.saturating_sub(2), line);
+        if let Some(i) = file { v.hits.push((Rect::new(area.x, area.y + cells(n), area.width.saturating_sub(1), 1), super::Hit::File(i))); }
     }
     for y in area.y..area.bottom() {
         draw(frame, area.right() - 1, y, 1, Line::styled("│", Style::default().fg(v.palette.border)));
@@ -102,9 +104,9 @@ fn cell(v: &DiffView, file: usize, idx: Option<usize>, side: Side, width: usize,
 
 fn note_lines(draft: &Draft, width: usize) -> Vec<Line<'static>> {
     if width < 4 { return vec![Line::from(plain("✎", width, theme::accent()))] }
-    let side = if draft.side == Side::Old { "old" } else { "new" };
+    let side = if draft.side == Side::Old { t!("old") } else { t!("new") };
     let range = if draft.start == draft.end { draft.start.to_string() } else { format!("{}–{}", draft.start, draft.end) };
-    let mut lines = vec![Line::from(plain(&format!("╭ ✎ note · {side} L{range}"), width, theme::accent()))];
+    let mut lines = vec![Line::from(plain(&t!("╭ ✎ note · {side} L{range}", side = side, range = range), width, theme::accent()))];
     let room = width.saturating_sub(3).max(1);
     for paragraph in draft.note.lines() {
         let (mut text, mut used) = (String::new(), 0);
@@ -213,7 +215,7 @@ fn stream(v: &DiffView, width: usize) -> Vec<Row> {
         out.push(Row { file, header: true, line: Some(file_header(v, file, width)), code: None, sources: Vec::new() });
         let body = rows(v, file, width);
         if body.is_empty() {
-            out.push(Row { file, header: false, line: Some(Line::styled("  No text changes", Style::default().fg(v.palette.muted))), code: None, sources: Vec::new() });
+            out.push(Row { file, header: false, line: Some(Line::styled(format!("  {}", t!("No text changes")), Style::default().fg(v.palette.muted))), code: None, sources: Vec::new() });
         } else { out.extend(body); }
     }
     out
@@ -230,7 +232,7 @@ pub(super) fn render(frame: &mut Frame, v: &mut DiffView) {
     let area = frame.area();
     v.hits.clear();
     if area.width == 0 || area.height == 0 { return }
-    let title = format!("{} · turn {} · {}", v.data.agent, v.data.turn, v.data.headline);
+    let title = t!("{agent} · turn {turn} · {headline}", agent = v.data.agent, turn = v.data.turn, headline = v.data.headline);
     draw(frame, area.x, area.y, area.width, Line::from(plain(&title, area.width as usize, theme::bold())));
     if area.height < 4 { return }
     let nav_width = if area.width >= 146 && area.height >= 8 { (area.width / 5).clamp(28, 38) } else { 0 };
@@ -240,6 +242,30 @@ pub(super) fn render(frame: &mut Frame, v: &mut DiffView) {
     let planned = stream(v, width as usize);
     let body_height = area.height.saturating_sub(3) as usize;
     v.page = body_height.max(1);
+    scroll(v, &planned);
+    let pinned = planned.get(v.scroll).map(|r| r.file).unwrap_or(v.file);
+    if v.data.files.get(pinned).is_some() {
+        draw(frame, x, area.y + 1, width, file_header(v, pinned, width as usize));
+    }
+    if nav_width > 0 { sidebar(frame, v, Rect::new(area.x, area.y + 2, nav_width, area.height - 3)); }
+    for (i, row) in planned.into_iter().skip(v.scroll).take(body_height).enumerate() {
+        let y = area.y + 2 + cells(i);
+        // The pinned header already labels a file at its initial stream position.
+        if row.header && i == 0 { continue }
+        push_hits(v, &row, Rect::new(x, y, width, 1));
+        let line = row.line.unwrap_or_else(|| code_row(v, row.file, row.code.expect("a review row has code or a note"), width as usize));
+        draw(frame, x, y, width, line);
+    }
+    if v.data.files.is_empty() {
+        draw(frame, x, area.y + 2, width, Line::from(plain(t!("No changes in this turn"), width as usize, theme::dim())));
+    }
+    let footer = footer_text(v, area.width);
+    draw(frame, area.x, area.bottom() - 1, area.width, Line::from(plain(&footer, area.width as usize, if v.input.is_some() || v.confirm_undo { theme::accent() } else { theme::dim() })));
+}
+
+/// Keep the cursor in view (or jump to its file's header); while the reader
+/// scrolls instead, the code at the top becomes where the cursor is.
+fn scroll(v: &mut DiffView, planned: &[Row]) {
     let cursor = planned.iter().position(|r| r.file == v.file && r.sources.contains(&v.cursor)).unwrap_or_else(|| planned.iter().position(|r| r.file == v.file && r.header).unwrap_or(0));
     if v.jump_file {
         v.scroll = planned.iter().position(|r| r.file == v.file && r.header).unwrap_or(0);
@@ -252,60 +278,59 @@ pub(super) fn render(frame: &mut Frame, v: &mut DiffView) {
     // Scrolling adopts the source at the viewport top so a later note addresses
     // the code being read, rather than an off-screen file.
     if !v.follow_cursor && v.mark.is_none() && v.input.is_none()
-        && let Some(row) = planned.iter().skip(v.scroll).find(|r| r.code.is_some())
+        && let Some((file, code)) = planned.iter().skip(v.scroll).find_map(|r| Some((r.file, r.code?)))
     {
-        v.file = row.file;
-        v.cursor = row.code.unwrap().first();
+        v.file = file;
+        v.cursor = code.first();
     }
-    let pinned = planned.get(v.scroll).map(|r| r.file).unwrap_or(v.file);
-    if v.data.files.get(pinned).is_some() {
-        draw(frame, x, area.y + 1, width, file_header(v, pinned, width as usize));
-    }
-    if nav_width > 0 { sidebar(frame, v, Rect::new(area.x, area.y + 2, nav_width, area.height - 3)); }
-    for (i, row) in planned.into_iter().skip(v.scroll).take(body_height).enumerate() {
-        let y = area.y + 2 + i as u16;
-        // The pinned header already labels a file at its initial stream position.
-        if row.header && i == 0 { continue }
-        if row.header { v.hits.push((Rect::new(x, y, width, 1), super::Hit::File(row.file))); }
-        if let Some(code) = row.code {
-            if v.layout() == Layout::SideBySide {
-                let half = width.saturating_sub(1) / 2;
-                for (index, side, rect) in [
-                    (code.left.or(code.full), Side::Old, Rect::new(x, y, half, 1)),
-                    (code.right.or(code.full), Side::New, Rect::new(x + half + 1, y, width - half - 1, 1)),
-                ] {
-                    if let Some(index) = index { v.hits.push((rect, super::Hit::Line(row.file, index, side))); }
-                }
-            } else if let Some(index) = code.full {
-                let side = if v.lines_for(row.file)[index].kind == LineKind::Del { Side::Old } else { Side::New };
-                v.hits.push((Rect::new(x, y, width, 1), super::Hit::Line(row.file, index, side)));
-            }
+}
+
+/// Where a click on this row lands: its file from a header, a line (and
+/// side) from code.
+fn push_hits(v: &mut DiffView, row: &Row, rect: Rect) {
+    let Rect { x, y, width, .. } = rect;
+    if row.header { v.hits.push((rect, super::Hit::File(row.file))); }
+    let Some(code) = row.code else { return };
+    if v.layout() == Layout::SideBySide {
+        let half = width.saturating_sub(1) / 2;
+        for (index, side, rect) in [
+            (code.left.or(code.full), Side::Old, Rect::new(x, y, half, 1)),
+            (code.right.or(code.full), Side::New, Rect::new(x + half + 1, y, width - half - 1, 1)),
+        ] {
+            if let Some(index) = index { v.hits.push((rect, super::Hit::Line(row.file, index, side))); }
         }
-        let line = row.line.unwrap_or_else(|| code_row(v, row.file, row.code.expect("a review row has code or a note"), width as usize));
-        draw(frame, x, y, width, line);
+    } else if let Some(index) = code.full {
+        let side = if v.lines_for(row.file)[index].kind == LineKind::Del { Side::Old } else { Side::New };
+        v.hits.push((rect, super::Hit::Line(row.file, index, side)));
     }
-    if v.data.files.is_empty() {
-        draw(frame, x, area.y + 2, width, Line::from(plain("No changes in this turn", width as usize, theme::dim())));
+}
+
+/// The note being typed, the undo question, a note from the caller, or as
+/// many keys as the width takes.
+fn footer_text(v: &DiffView, area_width: u16) -> String {
+    if let Some(buf) = &v.input {
+        return t!("note: {text}▏  Enter saves · Esc cancels", text = buf);
     }
-    let footer = if let Some(buf) = &v.input {
-        format!("note: {buf}▏  Enter saves · Esc cancels")
-    } else if v.confirm_undo {
-        format!("undo turn {} of {}: {}? y/n", v.data.turn, v.data.agent, v.data.headline)
-    } else if let Some(note) = &v.data.note {
-        note.clone()
-    } else {
-        let layout = if v.layout() == Layout::Unified { "s side by side" } else { "s unified" };
-        let notes = if v.drafts.is_empty() { String::new() } else { format!("  ⏎ send {} note{}", v.drafts.len(), if v.drafts.len() == 1 { "" } else { "s" }) };
-        let undo = if v.data.can_undo { "  u undo" } else { "" };
-        if area.width < 90 {
-            format!("↑↓ file  j/k line  v mark  c note  s split  q back{notes}")
-        } else if area.width < 140 {
-            format!("↑↓ files  j/k lines  ←→ pan  c note{notes}  {layout}  q back")
-        } else {
-            format!("↑↓ file  j/k line  ←→ pan  n/p hunk  v mark  c note{notes}{undo}  {layout}  [ ] turn  q back")
-        }
+    if v.confirm_undo {
+        return t!("undo turn {turn} of {agent}: {headline}? y/n", turn = v.data.turn, agent = v.data.agent, headline = v.data.headline);
+    }
+    if let Some(note) = &v.data.note {
+        return note.clone();
+    }
+    let layout = format!("s {}", if v.layout() == Layout::Unified { t!("side by side") } else { t!("unified") });
+    let notes = match v.drafts.len() {
+        0 => String::new(),
+        1 => format!("  {}", t!("⏎ send 1 note")),
+        n => format!("  {}", t!("⏎ send {n} notes", n = n)),
     };
-    draw(frame, area.x, area.bottom() - 1, area.width, Line::from(plain(&footer, area.width as usize, if v.input.is_some() || v.confirm_undo { theme::accent() } else { theme::dim() })));
+    let undo = if v.data.can_undo { format!("  u {}", t!("undo")) } else { String::new() };
+    if area_width < 90 {
+        t!("↑↓ file  j/k line  v mark  c note  s split  q back{notes}", notes = notes)
+    } else if area_width < 140 {
+        t!("↑↓ files  j/k lines  ←→ pan  c note{notes}  {layout}  q back", notes = notes, layout = layout)
+    } else {
+        t!("↑↓ file  j/k line  ←→ pan  n/p hunk  v mark  c note{notes}{undo}  {layout}  [ ] turn  q back", notes = notes, undo = undo, layout = layout)
+    }
 }
 
 #[cfg(test)]

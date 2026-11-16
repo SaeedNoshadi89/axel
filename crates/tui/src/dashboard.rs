@@ -4,6 +4,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use axel_i18n::t;
 use crate::model::{DashAgentRow, DashboardData, ThreadRow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +92,7 @@ impl Dashboard {
             *sel = 0;
         } else {
             *sel = (*sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
+            assert!(*sel < len, "the selection is on a row");
         }
     }
 
@@ -140,7 +142,7 @@ impl Dashboard {
             KeyCode::Char('s') if self.active_widget() == Widget::Threads => match self.selected_thread() {
                 Some(t) => DashAction::Spawn { thread_id: t.id.clone(), title: t.title.clone() },
                 None => {
-                    self.set_flash("No thread selected. Press n to start one.", now);
+                    self.set_flash(t!("No thread selected. Press n to start one."), now);
                     DashAction::None
                 }
             },
@@ -156,7 +158,7 @@ impl Dashboard {
             Widget::Threads => match self.selected_thread() {
                 Some(t) => DashAction::OpenThread(t.id.clone()),
                 None => {
-                    self.set_flash("No open threads. Press n to start one.", now);
+                    self.set_flash(t!("No open threads. Press n to start one."), now);
                     DashAction::None
                 }
             },
@@ -170,7 +172,7 @@ impl Dashboard {
                     }
                 },
                 None => {
-                    self.set_flash("No agents yet. Press n to create one.", now);
+                    self.set_flash(t!("No agents yet. Press n to create one."), now);
                     DashAction::None
                 }
             },
@@ -190,7 +192,7 @@ impl Dashboard {
                     }
                 },
                 None => {
-                    self.set_flash("No open threads. Press n to start one.", now);
+                    self.set_flash(t!("No open threads. Press n to start one."), now);
                     DashAction::None
                 }
             },
@@ -204,7 +206,7 @@ impl Dashboard {
                     }
                 },
                 None => {
-                    self.set_flash("No agents yet. Press n to create one.", now);
+                    self.set_flash(t!("No agents yet. Press n to create one."), now);
                     DashAction::None
                 }
             },
@@ -212,11 +214,11 @@ impl Dashboard {
     }
 
     pub fn help(&self) -> Vec<(&'static str, &'static str)> {
-        let mut v = vec![("n", "new thread"), ("enter", "open thread"), ("o", "pane")];
+        let mut v = vec![("n", t!("new thread")), ("enter", t!("open thread")), ("o", t!("pane"))];
         if self.active_widget() == Widget::Threads {
-            v.push(("s", "spawn agent"));
+            v.push(("s", t!("spawn agent")));
         }
-        v.extend([("tab", "widget"), ("i", "inbox"), ("q", "quit")]);
+        v.extend([("tab", t!("widget")), ("i", t!("inbox")), ("q", t!("quit"))]);
         v
     }
 }

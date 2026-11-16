@@ -6,14 +6,15 @@ use axel_inbox::Envelope;
 use rusqlite::{OptionalExtension, Row, ToSql, params, params_from_iter};
 
 use crate::log::{EVENT_COLS, row_envelope};
-use crate::wire::kind;
-use crate::{TurnMark, 
-    Error, Harness, INBOX_SCOPE, Participant, Session, SessionFilter, Status, Store, Thread,
+use crate::wire::{self, ParticipantAction, kind, tag};
+use crate::{TurnMark,
+    Error, Harness, INBOX_SCOPE, Participant, ParticipantRole, Session, SessionFilter, Status, Store, Thread,
     ThreadFilter, ThreadProject, ThreadSummary, ThreadWorkspace, Turn, TurnSummary, Usage,
     UsageSample, UsageTotals, UsageWindows, SessionContext, LimitWindow, PlanLimit,
+    SECONDS_PER_DAY, SECONDS_PER_HOUR, get_integer, sql_integer, sql_limit,
 };
 
-fn conv<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
+fn conversion_error<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
 
@@ -28,7 +29,7 @@ fn row_thread(r: &Row<'_>) -> rusqlite::Result<Thread> {
         id: r.get("id")?,
         title: r.get("title")?,
         intent: r.get("intent")?,
-        state: r.get::<_, String>("state")?.parse().map_err(conv)?,
+        state: r.get::<_, String>("state")?.parse().map_err(conversion_error)?,
         created_by: r.get("created_by")?,
         parent_thread_id: r.get("parent_thread_id")?,
         // Text this build does not know reads as "no relationship".
@@ -62,12 +63,12 @@ impl Store {
             if states.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut ph = Vec::new();
+            let mut placeholders = Vec::new();
             for s in states {
                 args.push(Box::new(s.as_str()));
-                ph.push(format!("?{}", args.len()));
+                placeholders.push(format!("?{}", args.len()));
             }
-            sql.push_str(&format!(" AND t.state IN ({})", ph.join(", ")));
+            sql.push_str(&format!(" AND t.state IN ({})", placeholders.join(", ")));
         }
         if let Some(a) = f.agent_pubkey {
             args.push(Box::new(a));
@@ -92,7 +93,7 @@ impl Store {
         }
         sql.push_str(" ORDER BY t.updated_at DESC, t.created_at DESC, t.id DESC");
         if let Some(limit) = f.limit {
-            args.push(Box::new(limit as i64));
+            args.push(Box::new(sql_limit(limit)));
             sql.push_str(&format!(" LIMIT ?{}", args.len()));
         }
         let mut st = self.conn.prepare(&sql)?;
@@ -117,18 +118,27 @@ impl Store {
         let mut roster: std::collections::BTreeSet<String> = self.distinct(
             "SELECT DISTINCT agent_pubkey FROM sessions WHERE thread_id = ?1", thread_id
         )?.into_iter().collect();
-        let mut st = self.conn.prepare("SELECT kind, tags_json, content FROM events WHERE thread_id = ?1 AND kind IN (?2, ?3) AND applied_at IS NOT NULL AND rejected_reason IS NULL ORDER BY created_at, id")?;
-        let events = st.query_map(rusqlite::params![thread_id, crate::wire::kind::THREAD_PARTICIPANT, crate::wire::kind::SESSION_START], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let mut statement = self.conn.prepare("SELECT kind, tags_json, content FROM events WHERE thread_id = ?1 AND kind IN (?2, ?3) AND applied_at IS NOT NULL AND rejected_reason IS NULL ORDER BY created_at, id")?;
+        let events = statement.query_map(rusqlite::params![thread_id, kind::THREAD_PARTICIPANT, kind::SESSION_START], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
         for event in events {
-            let (kind, tags, content) = event?;
+            let (event_kind, tags, content) = event?;
             let tags: Vec<Vec<String>> = serde_json::from_str(&tags)?;
-            let Some(target) = tags.iter().find(|t| t.first().is_some_and(|s| s == "p")).and_then(|t| t.get(1)) else { continue };
-            if kind == crate::wire::kind::SESSION_START as i64 {
+            let Some(target) = tags.iter().find(|t| t.first().is_some_and(|s| s == tag::MENTION)).and_then(|t| t.get(1)) else { continue };
+            if event_kind == kind::SESSION_START {
                 roster.insert(target.clone());
-            } else {
-                let op: serde_json::Value = serde_json::from_str(&content)?;
-                if op["op"] == "remove" { roster.remove(target); }
-                else if op["role"] == "agent" { roster.insert(target.clone()); }
+                continue;
+            }
+            // Only applied changes are read, and applying one parsed it.
+            let change: wire::ParticipantOp = serde_json::from_str(&content)?;
+            match change.op {
+                ParticipantAction::Remove => {
+                    roster.remove(target);
+                }
+                ParticipantAction::Add => {
+                    if change.role == Some(ParticipantRole::Agent) {
+                        roster.insert(target.clone());
+                    }
+                }
             }
         }
         Ok(roster.into_iter().collect())
@@ -220,7 +230,7 @@ impl Store {
                     kind: r
                         .get::<_, String>("workspace_kind")?
                         .parse()
-                        .map_err(conv)?,
+                        .map_err(conversion_error)?,
                     branch: r.get("branch")?,
                     worktree_path: r
                         .get::<_, Option<String>>("worktree_path")?
@@ -232,22 +242,29 @@ impl Store {
         })?;
         let mut out: Vec<ThreadProject> = rows.collect::<Result<_, _>>()?;
         if let Some(env) = local_env {
-            for tp in &mut out {
-                tp.local_project_id = match &tp.repo_key {
-                    Some(k) => self.project_by_repo_key(&env, k)?.map(|p| p.id),
-                    None => None,
-                }
-                .or(self
-                    .conn
-                    .query_row(
-                        "SELECT id FROM projects WHERE environment_id = ?1 AND path = ?2",
-                        params![env, tp.path_hint.to_string_lossy()],
-                        |r| r.get(0),
-                    )
-                    .optional()?);
+            for project in &mut out {
+                project.local_project_id = self.local_project_for(&env, project)?;
             }
         }
         Ok(out)
+    }
+
+    /// This replica's `projects.id` for an attached project: by repository
+    /// first, else by its path.
+    fn local_project_for(&self, env: &str, project: &ThreadProject) -> Result<Option<String>, Error> {
+        if let Some(key) = &project.repo_key
+            && let Some(found) = self.project_by_repo_key(env, key)?
+        {
+            return Ok(Some(found.id));
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM projects WHERE environment_id = ?1 AND path = ?2",
+                params![env, project.path_hint.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Who may act on a thread, owners first, then by join time.
@@ -260,7 +277,7 @@ impl Store {
             Ok(Participant {
                 thread_id: r.get("thread_id")?,
                 pubkey: r.get("pubkey")?,
-                role: r.get::<_, String>("role")?.parse().map_err(conv)?,
+                role: r.get::<_, String>("role")?.parse().map_err(conversion_error)?,
                 added_by: r.get("added_by")?,
                 added_at: r.get("added_at")?,
             })
@@ -284,6 +301,8 @@ fn row_session(r: &Row<'_>) -> rusqlite::Result<Session> {
         environment_label: r.get("environment_label")?,
         project_repo_key: r.get("project_repo_key")?,
         harness: Harness::parse(&r.get::<_, String>("harness")?),
+        // Text another build wrote reads as the default mode / runtime, the
+        // same leniency `wire::SessionStart` applies to the envelope.
         runtime_mode: r
             .get::<_, String>("runtime_mode")?
             .parse()
@@ -299,7 +318,7 @@ fn row_session(r: &Row<'_>) -> rusqlite::Result<Session> {
         rex_session_id: r.get("rex_session_id")?,
         rex_window_id: r.get("rex_window_id")?,
         rex_block_id: r.get("rex_block_id")?,
-        state: r.get::<_, String>("state")?.parse().map_err(conv)?,
+        state: r.get::<_, String>("state")?.parse().map_err(conversion_error)?,
         started_at: r.get("started_at")?,
         ended_at: r.get("ended_at")?,
         ended_reason: r.get("ended_reason")?,
@@ -337,16 +356,16 @@ impl Store {
             if states.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut ph = Vec::new();
+            let mut placeholders = Vec::new();
             for s in states {
                 args.push(Box::new(s.as_str()));
-                ph.push(format!("?{}", args.len()));
+                placeholders.push(format!("?{}", args.len()));
             }
-            sql.push_str(&format!(" AND s.state IN ({})", ph.join(", ")));
+            sql.push_str(&format!(" AND s.state IN ({})", placeholders.join(", ")));
         }
         sql.push_str(" ORDER BY s.started_at DESC, s.id DESC");
         if let Some(limit) = f.limit {
-            args.push(Box::new(limit as i64));
+            args.push(Box::new(sql_limit(limit)));
             sql.push_str(&format!(" LIMIT ?{}", args.len()));
         }
         let mut st = self.conn.prepare(&sql)?;
@@ -370,7 +389,7 @@ impl Store {
                 thread_id: r.get("thread_id")?,
                 session_id: r.get("session_id")?,
                 from_pubkey: r.get("from_pubkey")?,
-                created_at: r.get::<_, i64>("created_at")? as u64,
+                created_at: get_integer(r, "created_at")?,
                 summary: TurnSummary {
                     ordinal: r.get("ordinal")?,
                     user_text: r.get("user_text")?,
@@ -379,6 +398,8 @@ impl Store {
                     files_edited: r.get("files_edited")?,
                     duration_ms: r.get("duration_ms")?,
                     stop_reason: r.get("stop_reason")?,
+                    // A shape this build can't read shows as "no changes
+                    // recorded" rather than hiding the whole turn.
                     changes: r.get::<_, Option<String>>("changes_json")?.and_then(|j| serde_json::from_str(&j).ok()),
                 },
             })
@@ -401,6 +422,8 @@ impl Store {
                 before_tree: r.get("before_tree")?,
                 last_after_tree: r.get("last_after_tree")?,
                 user_text: r.get("user_text")?,
+                // Only marks files as authored in the turn's changes; an
+                // unreadable list loses that hint, not the hook's turn.
                 authored: serde_json::from_str(&r.get::<_, String>("authored_json")?).unwrap_or_default(),
                 tool_calls: r.get("tool_calls")?,
                 started_at: r.get("started_at")?,
@@ -441,7 +464,7 @@ fn row_status(r: &Row<'_>) -> rusqlite::Result<Status> {
         msg: r.get("msg")?,
         progress: r
             .get::<_, Option<i64>>("progress")?
-            .map(|p| p.clamp(0, 100) as u8),
+            .map(|p| u8::try_from(p.clamp(0, 100)).expect("a percentage clamped to 0..=100 fits in u8")),
         updated_at: r.get("updated_at")?,
     })
 }
@@ -487,6 +510,23 @@ pub(crate) const THREAD_USAGE_SQL: &str = "SELECT '' AS session_id,
                         SUM(turns) AS turns, SUM(cost_usd_est) AS cost_usd_est, MAX(at) AS updated_at
                  FROM effective_usage_log WHERE thread_id = ?1 GROUP BY session_id
              )";
+
+/// What [`Store::usage_windows`] sums usage by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsageGrouping {
+    Agent,
+    Thread,
+}
+
+impl UsageGrouping {
+    /// The `effective_usage_log` column that names the group.
+    fn column(self) -> &'static str {
+        match self {
+            UsageGrouping::Agent => "agent_pubkey",
+            UsageGrouping::Thread => "thread_id",
+        }
+    }
+}
 
 impl Store {
     /// Live status of one session.
@@ -554,15 +594,16 @@ impl Store {
 
     /// What each agent spent, most recent spender first.
     pub fn usage_by_agent(&self, now: i64) -> Result<Vec<UsageWindows>, Error> {
-        self.usage_windows("agent_pubkey", now, None)
+        self.usage_windows(UsageGrouping::Agent, now, None)
     }
 
     /// What each thread spent, most recent first, at most `limit` of them.
     pub fn usage_by_thread(&self, now: i64, limit: usize) -> Result<Vec<UsageWindows>, Error> {
-        self.usage_windows("thread_id", now, Some(limit))
+        self.usage_windows(UsageGrouping::Thread, now, Some(limit))
     }
 
-    fn usage_windows(&self, key: &str, now: i64, limit: Option<usize>) -> Result<Vec<UsageWindows>, Error> {
+    fn usage_windows(&self, grouping: UsageGrouping, now: i64, limit: Option<usize>) -> Result<Vec<UsageWindows>, Error> {
+        let key = grouping.column();
         // One pass: each window is a sum over the rows inside it.
         let sums = |w: &str| {
             ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "turns", "cost_usd_est"]
@@ -578,8 +619,8 @@ impl Store {
             sums("1"),
         );
         let mut st = self.conn.prepare(&sql)?;
-        let limit = limit.map(|l| l as i64).unwrap_or(-1);
-        let rows = st.query_map(params![now - 3600, now - 86_400, limit], |r| {
+        let limit = limit.map(sql_limit).unwrap_or(-1);
+        let rows = st.query_map(params![now - SECONDS_PER_HOUR, now - SECONDS_PER_DAY, limit], |r| {
             let totals = |at: usize| -> rusqlite::Result<UsageTotals> {
                 Ok(UsageTotals {
                     input_tokens: r.get(at)?,
@@ -600,17 +641,20 @@ impl Store {
     /// `now`, oldest first: a sparkline's worth.  `agent` `None` is everyone.
     pub fn usage_series(&self, agent: Option<&str>, now: i64, bucket_secs: i64, buckets: usize) -> Result<Vec<i64>, Error> {
         let bucket_secs = bucket_secs.max(1);
-        let since = now - bucket_secs * buckets as i64;
+        let since = now.saturating_sub(bucket_secs.saturating_mul(sql_limit(buckets)));
         let mut out = vec![0i64; buckets];
-        let mut st = self.conn.prepare(
+        let mut statement = self.conn.prepare(
             "SELECT (at - ?1) / ?2, SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens)
              FROM effective_usage_log WHERE at >= ?1 AND at < ?3 AND (?4 IS NULL OR agent_pubkey = ?4) GROUP BY 1",
         )?;
-        let rows = st.query_map(params![since, bucket_secs, now + 1, agent], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = statement.query_map(params![since, bucket_secs, now.saturating_add(1), agent], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
-            let (i, n) = row?;
-            if let Some(slot) = usize::try_from(i).ok().and_then(|i| out.get_mut(i.min(buckets.saturating_sub(1)))) {
-                *slot += n;
+            let (bucket, tokens) = row?;
+            // `at >= since` makes every bucket index non-negative; the last
+            // bucket also takes the second at `now` itself.
+            let Ok(bucket) = usize::try_from(bucket) else { continue };
+            if let Some(slot) = out.get_mut(bucket.min(buckets.saturating_sub(1))) {
+                *slot = slot.saturating_add(tokens);
             }
         }
         Ok(out)
@@ -694,7 +738,7 @@ impl Store {
              WHERE m.pubkey = ?1 AND e.applied_at IS NOT NULL
              ORDER BY e.created_at DESC, e.id DESC LIMIT ?2"
         ))?;
-        let rows = st.query_map(params![pubkey, limit as i64], row_envelope)?;
+        let rows = st.query_map(params![pubkey, sql_limit(limit)], row_envelope)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -715,7 +759,7 @@ impl Store {
                 |r| r.get(0),
             )?,
         };
-        Ok(n as u64)
+        Ok(u64::try_from(n).expect("COUNT(*) is never negative"))
     }
 
     /// Advance `pubkey`'s read frontier; it never moves backwards.
@@ -732,7 +776,7 @@ impl Store {
              WHERE excluded.through_created_at > read_frontiers.through_created_at
                 OR (excluded.through_created_at = read_frontiers.through_created_at
                     AND excluded.through_id > read_frontiers.through_id)",
-            params![pubkey, INBOX_SCOPE, through_created_at as i64, through_id],
+            params![pubkey, INBOX_SCOPE, sql_integer(through_created_at, "read frontier created_at")?, through_id],
         )?;
         Ok(())
     }

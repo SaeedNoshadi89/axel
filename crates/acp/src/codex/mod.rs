@@ -30,21 +30,34 @@
 pub mod tools;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axel_i18n::t;
 use serde_json::{Value, json};
 
-use crate::agent_rpc::{Client, Lines, RpcError, RpcResult};
+use crate::agent_rpc::{Client, Lines, RpcError, RpcResult, bounded_lines};
 use crate::usage::{CodexMeter, codex_limits, limits_params};
 
 /// codex-acp's `/init` prompt.
 const INIT_PROMPT: &str = include_str!("init_prompt.md");
+
+/// How long Codex has to answer an ordinary request (a steer, an
+/// interrupt): it answers at once unless it is stuck.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long Codex has to start something: `initialize`, a turn, a review,
+/// a compaction, the model list.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long Codex has to open a thread: resuming one reads its history.
+const THREAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// The slash commands go out this long after the session reply, so the
+/// client knows the session before it hears about it.
+const COMMANDS_DELAY: Duration = Duration::from_millis(20);
 
 /// `codex app-server` and the conversation it holds.
 struct Codex {
@@ -60,7 +73,8 @@ impl Codex {
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().expect("pending lock").insert(id, tx);
+        let previous = self.pending.lock().expect("pending lock").insert(id, tx);
+        debug_assert!(previous.is_none(), "request ids come from a counter: never reused");
         self.stdin.send(&json!({ "id": id, "method": method, "params": params }));
         match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Ok(v),
@@ -79,6 +93,8 @@ impl Codex {
 
 impl Drop for Codex {
     fn drop(&mut self) {
+        // Codex may have exited already (kill then fails, and wait returns
+        // its status): either way it is gone, which is all that is wanted.
         if let Ok(mut c) = self.child.lock() {
             let _ = c.kill();
             let _ = c.wait();
@@ -86,11 +102,43 @@ impl Drop for Codex {
     }
 }
 
-/// Per-item state while a turn runs.
+/// The most of one command's output kept while it runs.  Axel's host stores
+/// 16 KiB of a tool's output; 1 MiB leaves room for a client that shows
+/// more, without holding a runaway build log whole.
+const COMMAND_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// A running command's output, up to [`COMMAND_OUTPUT_LIMIT_BYTES`].
+#[derive(Default)]
+struct CommandOutput {
+    text: String,
+    is_cut: bool,
+}
+
+impl CommandOutput {
+    fn push(&mut self, delta: &str) {
+        if self.is_cut {
+            return;
+        }
+        let room_bytes = COMMAND_OUTPUT_LIMIT_BYTES.saturating_sub(self.text.len());
+        if delta.len() <= room_bytes {
+            self.text.push_str(delta);
+            return;
+        }
+        let mut end = room_bytes;
+        while !delta.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&delta[..end]);
+        self.text.push_str("\n[output cut]\n");
+        self.is_cut = true;
+    }
+}
+
+/// Per-item state while a turn runs (one turn's items, dropped when it ends).
 #[derive(Default)]
 struct Items {
     /// Output collected per command, shown when it ends.
-    output: HashMap<String, String>,
+    output: HashMap<String, CommandOutput>,
     extension: HashMap<String, Option<String>>,
     /// Items whose text arrived as deltas (so the full text isn't sent again).
     streamed: HashSet<String>,
@@ -101,7 +149,7 @@ struct Items {
 struct Session {
     id: String,
     codex: Arc<Codex>,
-    mode: Mutex<String>,
+    mode: Mutex<Mode>,
     model: Mutex<Option<String>>,
     turn: Mutex<Option<String>>,
     /// What each turn spent, from Codex's token reports.
@@ -117,7 +165,7 @@ struct Agent {
 pub fn serve_stdio() -> anyhow::Result<()> {
     let client = Arc::new(Client::stdio());
     let agent = Arc::new(Agent { client: client.clone(), sessions: Mutex::new(HashMap::new()) });
-    for line in std::io::stdin().lock().lines() {
+    for line in bounded_lines(std::io::stdin().lock(), "axel codex-acp") {
         let Ok(line) = line else { break };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
         let Some(method) = msg.get("method").and_then(Value::as_str).map(String::from) else {
@@ -143,23 +191,56 @@ pub fn serve_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Approval policy and sandbox for a mode id.
-fn policy(mode: &str) -> (&'static str, Value, &'static str) {
-    match mode {
-        // Never asks, no sandbox: Axel's autopilot (its guard still applies).
-        "bypassPermissions" | "full-access" => ("never", json!({ "type": "dangerFullAccess" }), "danger-full-access"),
-        // Edits inside the workspace go through; anything else asks.
-        "acceptEdits" | "auto" => ("on-request", json!({ "type": "workspaceWrite" }), "workspace-write"),
-        // Read-only: look and propose.
-        "plan" | "read-only" => ("on-request", json!({ "type": "readOnly" }), "read-only"),
-        // Ask before anything that isn't known to be safe.
-        _ => ("untrusted", json!({ "type": "workspaceWrite" }), "workspace-write"),
+/// The session modes, by the ids the host asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Default,
+    AcceptEdits,
+    Plan,
+    BypassPermissions,
+}
+
+impl Mode {
+    /// The ACP mode id.
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Default => "default",
+            Mode::AcceptEdits => "acceptEdits",
+            Mode::Plan => "plan",
+            Mode::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    /// A mode id: ours, or one of codex-acp's preset ids.
+    fn parse(id: &str) -> Option<Mode> {
+        Some(match id {
+            "default" => Mode::Default,
+            "acceptEdits" | "auto" => Mode::AcceptEdits,
+            "plan" | "read-only" => Mode::Plan,
+            "bypassPermissions" | "full-access" => Mode::BypassPermissions,
+            _ => return None,
+        })
     }
 }
 
-fn modes(current: &str) -> Value {
+/// Approval policy and sandbox for a mode: the policy, the sandbox as a
+/// turn takes it, and as a thread takes it.
+fn policy(mode: Mode) -> (&'static str, Value, &'static str) {
+    match mode {
+        // Never asks, no sandbox: Axel's autopilot (its guard still applies).
+        Mode::BypassPermissions => ("never", json!({ "type": "dangerFullAccess" }), "danger-full-access"),
+        // Edits inside the workspace go through; anything else asks.
+        Mode::AcceptEdits => ("on-request", json!({ "type": "workspaceWrite" }), "workspace-write"),
+        // Read-only: look and propose.
+        Mode::Plan => ("on-request", json!({ "type": "readOnly" }), "read-only"),
+        // Ask before anything that isn't known to be safe.
+        Mode::Default => ("untrusted", json!({ "type": "workspaceWrite" }), "workspace-write"),
+    }
+}
+
+fn modes(current: Mode) -> Value {
     json!({
-        "currentModeId": current,
+        "currentModeId": current.as_str(),
         "availableModes": [
             { "id": "default", "name": "Default", "description": "Asks before anything that isn't known to be safe" },
             { "id": "acceptEdits", "name": "Accept Edits", "description": "Edits inside the workspace go through; anything else asks" },
@@ -201,7 +282,7 @@ impl Agent {
                 };
                 let message_id = params.get("messageId").and_then(Value::as_str).unwrap_or("").to_string();
                 let steer = json!({ "threadId": s.id, "expectedTurnId": turn, "input": prompt_input(&params), "clientUserMessageId": message_id });
-                match s.codex.request("turn/steer", steer, Duration::from_secs(30)) {
+                match s.codex.request("turn/steer", steer, REQUEST_TIMEOUT) {
                     Ok(_) => {
                         self.client.notify("_axel/steered", json!({ "sessionId": s.id, "messageId": message_id }));
                         Ok(json!({ "accepted": true }))
@@ -216,21 +297,14 @@ impl Agent {
                 let s = self.session(&params)?;
                 let turn = s.turn.lock().expect("turn lock").clone();
                 if let Some(turn) = turn {
-                    s.codex.request("turn/interrupt", json!({ "threadId": s.id, "turnId": turn }), Duration::from_secs(30)).map_err(RpcError::invalid)?;
+                    s.codex.request("turn/interrupt", json!({ "threadId": s.id, "turnId": turn }), REQUEST_TIMEOUT).map_err(RpcError::invalid)?;
                 }
                 Ok(Value::Null)
             }
             "session/set_mode" => {
                 let s = self.session(&params)?;
-                let mode = params.get("modeId").and_then(Value::as_str).unwrap_or("");
-                let mode = match mode {
-                    "default" | "acceptEdits" | "plan" | "bypassPermissions" => mode,
-                    "read-only" => "plan",
-                    "auto" => "acceptEdits",
-                    "full-access" => "bypassPermissions",
-                    _ => return Err(RpcError::invalid("Invalid Mode")),
-                };
-                *s.mode.lock().expect("mode lock") = mode.to_string();
+                let mode = params.get("modeId").and_then(Value::as_str).and_then(Mode::parse).ok_or_else(|| RpcError::invalid("Invalid Mode"))?;
+                *s.mode.lock().expect("mode lock") = mode;
                 Ok(json!({}))
             }
             "session/set_model" => {
@@ -253,32 +327,17 @@ impl Agent {
         let cwd = PathBuf::from(params.get("cwd").and_then(Value::as_str).unwrap_or("."));
         let codex = spawn_codex(&cwd)?;
         codex
-            .request("initialize", json!({ "clientInfo": { "name": "axel", "title": "Axel", "version": env!("CARGO_PKG_VERSION") } }), Duration::from_secs(60))
+            .request("initialize", json!({ "clientInfo": { "name": "axel", "title": "Axel", "version": env!("CARGO_PKG_VERSION") } }), START_TIMEOUT)
             .map_err(RpcError::internal)?;
         codex.stdin.send(&json!({ "method": "initialized" }));
 
-        let (approval, _, sandbox) = policy("default");
-        let mut thread = json!({ "cwd": cwd, "approvalPolicy": approval, "sandbox": sandbox });
-        if let Some(append) = params.pointer("/_meta/systemPrompt/append").and_then(Value::as_str) {
-            thread["developerInstructions"] = json!(append);
-        } else if let Some(sp) = params.pointer("/_meta/systemPrompt").and_then(Value::as_str) {
-            thread["baseInstructions"] = json!(sp);
-        }
-        let mcp = mcp_config(params);
-        if !mcp.is_empty() {
-            thread["config"] = json!({ "mcp_servers": mcp });
-        }
-        // The agent's reasoning effort, from the host (`_meta.axel.effort`):
-        // the same override as `-c model_reasoning_effort=LEVEL`.
-        if let Some(effort) = crate::host::meta_effort(params).and_then(|e| axel_store::Harness::Codex.native_effort(e)) {
-            thread["config"]["model_reasoning_effort"] = json!(effort);
-        }
+        let mut thread = thread_params(params, &cwd);
         let started = match &resume {
             Some(id) => {
                 thread["threadId"] = json!(id);
-                codex.request("thread/resume", thread, Duration::from_secs(120))
+                codex.request("thread/resume", thread, THREAD_TIMEOUT)
             }
-            None => codex.request("thread/start", thread, Duration::from_secs(120)),
+            None => codex.request("thread/start", thread, THREAD_TIMEOUT),
         }
         .map_err(|e| if resume.is_some() { RpcError::invalid(format!("Session not found: {e}")) } else { RpcError::internal(e) })?;
         let thread_id = started.pointer("/thread/id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -287,25 +346,13 @@ impl Agent {
         let session = Arc::new(Session {
             id: thread_id.clone(),
             codex: codex.clone(),
-            mode: Mutex::new("default".into()),
+            mode: Mutex::new(Mode::Default),
             model: Mutex::new(None),
             turn: Mutex::new(None),
             meter: Mutex::new(CodexMeter::new(current_model.clone())),
         });
         self.sessions.lock().expect("sessions lock").insert(thread_id.clone(), session.clone());
-        // Where the plan's limits stand, without holding up the session.
-        {
-            let (codex, client) = (codex.clone(), self.client.clone());
-            std::thread::spawn(move || {
-                if let Ok(reply) = codex.request("account/rateLimits/read", Value::Null, Duration::from_secs(30)) {
-                    let limits = codex_limits(&reply);
-                    if !limits.is_empty() {
-                        client.notify("_axel/limits", limits_params(&limits));
-                    }
-                }
-            });
-        }
-
+        self.read_limits_later(&codex);
         if resume.is_some() {
             let mut items = Items::default();
             for turn in started.pointer("/thread/turns").and_then(Value::as_array).into_iter().flatten() {
@@ -314,33 +361,40 @@ impl Agent {
                 }
             }
         }
-
-        let listed = codex.request("model/list", json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
-        let models: Vec<Value> = listed
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|m| !m.get("hidden").and_then(Value::as_bool).unwrap_or(false))
-            .map(|m| json!({ "modelId": m.get("id"), "name": m.get("displayName"), "description": m.get("description") }))
-            .collect();
-        let current = current_model.or_else(|| {
-            listed.get("data").and_then(Value::as_array)?.iter().find(|m| m.get("isDefault").and_then(Value::as_bool) == Some(true))?.get("id")?.as_str().map(String::from)
-        });
-
-        // codex-acp's slash commands, once the reply is out.
-        let client = self.client.clone();
-        let sid = thread_id.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            client.update(&sid, json!({ "sessionUpdate": "available_commands_update", "availableCommands": commands() }));
-        });
-
+        let models = list_models(&codex, current_model);
+        self.send_commands_later(&thread_id);
         Ok(json!({
             "sessionId": thread_id,
-            "modes": modes("default"),
-            "models": { "availableModels": models, "currentModelId": current },
+            "modes": modes(Mode::Default),
+            "models": models,
         }))
+    }
+
+    /// Where the plan's limits stand, without holding up the session.
+    fn read_limits_later(&self, codex: &Arc<Codex>) {
+        let (codex, client) = (codex.clone(), self.client.clone());
+        std::thread::spawn(move || {
+            match codex.request("account/rateLimits/read", Value::Null, REQUEST_TIMEOUT) {
+                Ok(reply) => {
+                    let limits = codex_limits(&reply);
+                    if !limits.is_empty() {
+                        client.notify("_axel/limits", limits_params(&limits));
+                    }
+                }
+                // The limits show once Codex reports them on its own.
+                Err(e) => eprintln!("[axel codex-acp] account/rateLimits/read: {e}"),
+            }
+        });
+    }
+
+    /// codex-acp's slash commands, once the session reply is out.
+    fn send_commands_later(&self, session_id: &str) {
+        let client = self.client.clone();
+        let sid = session_id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(COMMANDS_DELAY);
+            client.update(&sid, json!({ "sessionUpdate": "available_commands_update", "availableCommands": commands() }));
+        });
     }
 
     /// One prompt: a turn (or a review or compaction), relayed until it ends.
@@ -348,21 +402,20 @@ impl Agent {
         let s = self.session(params)?;
         let input = prompt_input(params);
         let text = input.first().and_then(|i| i.get("text")).and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let (approval, sandbox, _) = policy(&s.mode.lock().expect("mode lock").clone());
+        let (approval, sandbox, _) = policy(*s.mode.lock().expect("mode lock"));
 
-        let started = if let Some(rest) = slash(&text, "compact") {
-            let _ = rest;
-            s.codex.request("thread/compact/start", json!({ "threadId": s.id }), Duration::from_secs(60)).map_err(RpcError::internal)?;
+        let started = if slash(&text, "compact").is_some() {
+            s.codex.request("thread/compact/start", json!({ "threadId": s.id }), START_TIMEOUT).map_err(RpcError::internal)?;
             None
         } else if let Some(target) = review_target(&text) {
-            Some(s.codex.request("review/start", json!({ "threadId": s.id, "target": target }), Duration::from_secs(60)).map_err(RpcError::internal)?)
+            Some(s.codex.request("review/start", json!({ "threadId": s.id, "target": target }), START_TIMEOUT).map_err(RpcError::internal)?)
         } else {
             let input = if slash(&text, "init").is_some() { vec![json!({ "type": "text", "text": INIT_PROMPT, "text_elements": [] })] } else { input };
             let mut turn = json!({ "threadId": s.id, "input": input, "approvalPolicy": approval, "sandboxPolicy": sandbox });
             if let Some(m) = s.model.lock().expect("model lock").clone() {
                 turn["model"] = json!(m);
             }
-            Some(s.codex.request("turn/start", turn, Duration::from_secs(60)).map_err(RpcError::internal)?)
+            Some(s.codex.request("turn/start", turn, START_TIMEOUT).map_err(RpcError::internal)?)
         };
         let turn_id = started.as_ref().and_then(|r| r.pointer("/turn/id")).and_then(Value::as_str).map(String::from);
         *s.turn.lock().expect("turn lock") = turn_id.clone();
@@ -395,76 +448,59 @@ impl Agent {
                 self.answer(s, &mut items, &method, &id, &p);
                 continue;
             }
-            match method.as_str() {
-                "item/started" => self.item_started(s, &mut items, p.get("item").unwrap_or(&Value::Null)),
-                "item/completed" => self.item_completed(s, &mut items, p.get("item").unwrap_or(&Value::Null)),
-                "item/agentMessage/delta" => {
-                    items.streamed.insert(p.get("itemId").and_then(Value::as_str).unwrap_or("").to_string());
-                    self.text(s, "agent_message_chunk", p.get("delta").and_then(Value::as_str).unwrap_or(""));
-                }
-                "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-                    items.streamed.insert(p.get("itemId").and_then(Value::as_str).unwrap_or("").to_string());
-                    self.text(s, "agent_thought_chunk", p.get("delta").and_then(Value::as_str).unwrap_or(""));
-                }
-                "item/reasoning/summaryPartAdded" => self.text(s, "agent_thought_chunk", "\n\n"),
-                "item/commandExecution/outputDelta" => {
-                    let id = p.get("itemId").and_then(Value::as_str).unwrap_or("").to_string();
-                    items.output.entry(id).or_default().push_str(p.get("delta").and_then(Value::as_str).unwrap_or(""));
-                }
-                "turn/plan/updated" => {
-                    let entries: Vec<Value> = p
-                        .get("plan")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .map(|step| {
-                            let status = match step.get("status").and_then(Value::as_str) {
-                                Some("inProgress") => "in_progress",
-                                Some("completed") => "completed",
-                                _ => "pending",
-                            };
-                            json!({ "content": step.get("step"), "priority": "medium", "status": status })
-                        })
-                        .collect();
-                    self.client.update(&s.id, json!({ "sessionUpdate": "plan", "entries": entries }));
-                }
-                "account/rateLimits/updated" => self.notify_limits(&p),
-                "thread/tokenUsage/updated" => {
-                    let usage = p.get("tokenUsage").cloned().unwrap_or(Value::Null);
-                    let progress = {
-                        let mut meter = s.meter.lock().expect("meter lock");
-                        meter.observe(&usage);
-                        meter.progress(std::time::Instant::now())
-                    };
-                    // A long turn's spend shows as it happens, not at its end.
-                    if let Some(p) = progress {
-                        self.client.notify("_axel/usage", p.into_reply(json!({ "sessionId": s.id })));
-                    }
-                    if let Some(size) = usage.get("modelContextWindow").and_then(Value::as_u64) {
-                        let used = usage.pointer("/last/totalTokens").and_then(Value::as_u64).unwrap_or(0);
-                        self.client.update(&s.id, json!({ "sessionUpdate": "usage_update", "used": used, "size": size }));
-                    }
-                }
-                "warning" | "guardianWarning" => {
-                    if let Some(m) = p.get("message").and_then(Value::as_str) {
-                        self.text(s, "agent_message_chunk", m);
-                    }
-                }
-                "thread/compacted" if turn_id.is_none() => return Ok(json!({ "stopReason": "end_turn" })),
-                "turn/completed" => {
-                    let turn = p.get("turn").cloned().unwrap_or(Value::Null);
-                    let id = turn.get("id").and_then(Value::as_str);
-                    if turn_id.is_some() && id != turn_id {
-                        continue;
-                    }
-                    return match turn.get("status").and_then(Value::as_str) {
-                        Some("interrupted") => Ok(json!({ "stopReason": "cancelled" })),
-                        Some("failed") => Err(RpcError::internal(turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("Codex failed the turn"))),
-                        _ => Ok(json!({ "stopReason": "end_turn" })),
-                    };
-                }
-                _ => {}
+            if let Some(end) = self.relay_event(s, &mut items, &method, &p, turn_id) {
+                return end;
             }
+        }
+    }
+
+    /// One of Codex's notifications.  `Some` when it ends the turn.
+    fn relay_event(&self, s: &Session, items: &mut Items, method: &str, p: &Value, turn_id: Option<&str>) -> Option<RpcResult> {
+        let delta = || p.get("delta").and_then(Value::as_str).unwrap_or("");
+        let item_id = || p.get("itemId").and_then(Value::as_str).unwrap_or("").to_string();
+        match method {
+            "item/started" => self.item_started(s, items, p.get("item").unwrap_or(&Value::Null)),
+            "item/completed" => self.item_completed(s, items, p.get("item").unwrap_or(&Value::Null)),
+            "item/agentMessage/delta" => {
+                items.streamed.insert(item_id());
+                self.text(s, "agent_message_chunk", delta());
+            }
+            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                items.streamed.insert(item_id());
+                self.text(s, "agent_thought_chunk", delta());
+            }
+            "item/reasoning/summaryPartAdded" => self.text(s, "agent_thought_chunk", "\n\n"),
+            "item/commandExecution/outputDelta" => items.output.entry(item_id()).or_default().push(delta()),
+            "turn/plan/updated" => self.client.update(&s.id, json!({ "sessionUpdate": "plan", "entries": plan_entries(p) })),
+            "account/rateLimits/updated" => self.notify_limits(p),
+            "thread/tokenUsage/updated" => self.on_token_usage(s, p),
+            "warning" | "guardianWarning" => {
+                if let Some(m) = p.get("message").and_then(Value::as_str) {
+                    self.text(s, "agent_message_chunk", m);
+                }
+            }
+            "thread/compacted" if turn_id.is_none() => return Some(Ok(json!({ "stopReason": "end_turn" }))),
+            "turn/completed" => return turn_end(p, turn_id),
+            _ => {}
+        }
+        None
+    }
+
+    /// A token report: the turn's spend so far, and how full the context is.
+    fn on_token_usage(&self, s: &Session, p: &Value) {
+        let usage = p.get("tokenUsage").cloned().unwrap_or(Value::Null);
+        let progress = {
+            let mut meter = s.meter.lock().expect("meter lock");
+            meter.observe(&usage);
+            meter.progress(std::time::Instant::now())
+        };
+        // A long turn's spend shows as it happens, not at its end.
+        if let Some(p) = progress {
+            self.client.notify("_axel/usage", p.into_reply(json!({ "sessionId": s.id })));
+        }
+        if let Some(size) = usage.get("modelContextWindow").and_then(Value::as_u64) {
+            let used = usage.pointer("/last/totalTokens").and_then(Value::as_u64).unwrap_or(0);
+            self.client.update(&s.id, json!({ "sessionUpdate": "usage_update", "used": used, "size": size }));
         }
     }
 
@@ -525,25 +561,7 @@ impl Agent {
                 let summary: Vec<&str> = item.get("summary").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
                 self.text(s, "agent_thought_chunk", &summary.join("\n\n"));
             }
-            "commandExecution" => {
-                let status = item.get("status").and_then(Value::as_str);
-                let mut output = items.output.remove(&id).unwrap_or_default();
-                if output.is_empty() {
-                    output = item.get("aggregatedOutput").and_then(Value::as_str).unwrap_or("").to_string();
-                }
-                let ext = items.extension.remove(&id).flatten();
-                let mut u = json!({
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": id,
-                    // codex-acp: completed, or exited 0; failed and declined fail.
-                    "status": if status == Some("completed") || item.get("exitCode").and_then(Value::as_i64) == Some(0) || !failed(status) { "completed" } else { "failed" },
-                    "rawOutput": item,
-                });
-                if let Some(c) = tools::command_output(&output, ext.as_deref()) {
-                    u["content"] = json!([c]);
-                }
-                self.client.update(&s.id, u);
-            }
+            "commandExecution" => self.command_completed(s, items, &id, item),
             "fileChange" => {
                 let (title, locations, content) = tools::file_changes(item);
                 let status = if failed(item.get("status").and_then(Value::as_str)) { "failed" } else { "completed" };
@@ -587,6 +605,28 @@ impl Agent {
             "contextCompaction" => self.text(s, "agent_message_chunk", "Context compacted\n"),
             _ => {}
         }
+    }
+
+    /// A command that ended: its status, and the output collected while it ran.
+    fn command_completed(&self, s: &Session, items: &mut Items, id: &str, item: &Value) {
+        let status = item.get("status").and_then(Value::as_str);
+        let failed = matches!(status, Some("failed" | "declined"));
+        let mut output = items.output.remove(id).map(|o| o.text).unwrap_or_default();
+        if output.is_empty() {
+            output = item.get("aggregatedOutput").and_then(Value::as_str).unwrap_or("").to_string();
+        }
+        let ext = items.extension.remove(id).flatten();
+        let mut u = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            // codex-acp: completed, or exited 0; failed and declined fail.
+            "status": if status == Some("completed") || item.get("exitCode").and_then(Value::as_i64) == Some(0) || !failed { "completed" } else { "failed" },
+            "rawOutput": item,
+        });
+        if let Some(c) = tools::command_output(&output, ext.as_deref()) {
+            u["content"] = json!([c]);
+        }
+        self.client.update(&s.id, u);
     }
 
     /// A saved item, for `session/load`: messages as chunks, tools as finished calls.
@@ -640,8 +680,8 @@ impl Agent {
                     s,
                     &tool_call,
                     vec![
-                        json!({ "optionId": "approved", "name": "Yes", "kind": "allow_once" }),
-                        json!({ "optionId": "abort", "name": "No, provide feedback", "kind": "reject_once" }),
+                        json!({ "optionId": "approved", "name": t!("Yes"), "kind": "allow_once" }),
+                        json!({ "optionId": "abort", "name": t!("No, provide feedback"), "kind": "reject_once" }),
                     ],
                 );
                 let decision = if picked.as_deref() == Some("approved") { "accept" } else { "cancel" };
@@ -652,16 +692,16 @@ impl Agent {
                 if let Some(r) = p.get("reason").and_then(Value::as_str) {
                     text.push(r.to_string());
                 }
-                text.push(format!("Permissions: {}", p.get("permissions").map(|v| v.to_string()).unwrap_or_default()));
+                text.push(t!("Permissions: {permissions}", permissions = p.get("permissions").map(|v| v.to_string()).unwrap_or_default()));
                 let tool_call = json!({ "toolCallId": item_id, "title": "Request permissions", "status": "pending", "rawInput": p,
                     "content": [{ "type": "content", "content": { "type": "text", "text": text.join("\n") } }] });
                 let picked = self.ask(
                     s,
                     &tool_call,
                     vec![
-                        json!({ "optionId": "approved", "name": "Yes, for this turn", "kind": "allow_once" }),
-                        json!({ "optionId": "approved-for-session", "name": "Yes, for this session", "kind": "allow_always" }),
-                        json!({ "optionId": "denied", "name": "No", "kind": "reject_once" }),
+                        json!({ "optionId": "approved", "name": t!("Yes, for this turn"), "kind": "allow_once" }),
+                        json!({ "optionId": "approved-for-session", "name": t!("Yes, for this session"), "kind": "allow_always" }),
+                        json!({ "optionId": "denied", "name": t!("No"), "kind": "reject_once" }),
                     ],
                 );
                 let grant = match picked.as_deref() {
@@ -680,6 +720,8 @@ impl Agent {
 
     /// `session/request_permission`: the option picked, or `None` if cancelled.
     fn ask(&self, s: &Session, tool_call: &Value, options: Vec<Value>) -> Option<String> {
+        // A failed request (the client went away) is a cancelled one: Codex
+        // is told no, which is the safe answer.
         let reply = self.client.request("session/request_permission", json!({ "sessionId": s.id, "toolCall": tool_call, "options": options })).ok()?;
         let outcome = reply.get("outcome")?;
         (outcome.get("outcome").and_then(Value::as_str) == Some("selected")).then(|| outcome.get("optionId").and_then(Value::as_str).map(String::from)).flatten()
@@ -697,17 +739,18 @@ fn spawn_codex(cwd: &PathBuf) -> Result<Arc<Codex>, RpcError> {
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| RpcError::internal(format!("starting {exe} app-server: {e}")))?;
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
+    let stdin = child.stdin.take().expect("stdin was set to piped above");
+    let stdout = child.stdout.take().expect("stdout was set to piped above");
     let (tx, rx) = mpsc::channel();
     let codex = Arc::new(Codex { stdin: Lines::new(stdin), child: Mutex::new(child), next_id: AtomicU64::new(1), pending: Mutex::new(HashMap::new()), events: Mutex::new(rx) });
     let reader = codex.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in bounded_lines(BufReader::new(stdout), "axel codex-acp").map_while(Result::ok) {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg.get("method").is_none() {
                 let Some(id) = msg.get("id").and_then(Value::as_u64) else { continue };
                 if let Some(waiter) = reader.pending.lock().expect("pending lock").remove(&id) {
+                    // The requester timed out meanwhile: nobody to tell.
                     let _ = waiter.send(match msg.get("error") {
                         Some(e) => Err(e.clone()),
                         None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
@@ -720,6 +763,81 @@ fn spawn_codex(cwd: &PathBuf) -> Result<Arc<Codex>, RpcError> {
         reader.pending.lock().expect("pending lock").clear();
     });
     Ok(codex)
+}
+
+/// The thread's settings: approval and sandbox for the default mode, the
+/// instructions, MCP servers and reasoning effort the host asks for.
+fn thread_params(params: &Value, cwd: &Path) -> Value {
+    let (approval, _, sandbox) = policy(Mode::Default);
+    let mut thread = json!({ "cwd": cwd, "approvalPolicy": approval, "sandbox": sandbox });
+    if let Some(append) = params.pointer("/_meta/systemPrompt/append").and_then(Value::as_str) {
+        thread["developerInstructions"] = json!(append);
+    } else if let Some(sp) = params.pointer("/_meta/systemPrompt").and_then(Value::as_str) {
+        thread["baseInstructions"] = json!(sp);
+    }
+    let mcp = mcp_config(params);
+    if !mcp.is_empty() {
+        thread["config"] = json!({ "mcp_servers": mcp });
+    }
+    // The agent's reasoning effort, from the host (`_meta.axel.effort`):
+    // the same override as `-c model_reasoning_effort=LEVEL`.
+    if let Some(effort) = crate::host::meta_effort(params).and_then(|e| axel_store::Harness::Codex.native_effort(e)) {
+        thread["config"]["model_reasoning_effort"] = json!(effort);
+    }
+    thread
+}
+
+/// The ACP `models` for a session reply: what Codex lists (but hides), and
+/// the thread's model, else Codex's default.
+fn list_models(codex: &Codex, current_model: Option<String>) -> Value {
+    // Without the list the session still runs, on Codex's default model.
+    let listed = codex.request("model/list", json!({}), START_TIMEOUT).unwrap_or_else(|e| {
+        eprintln!("[axel codex-acp] model/list: {e}");
+        Value::Null
+    });
+    let models: Vec<Value> = listed
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| !m.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+        .map(|m| json!({ "modelId": m.get("id"), "name": m.get("displayName"), "description": m.get("description") }))
+        .collect();
+    let current = current_model.or_else(|| {
+        listed.get("data").and_then(Value::as_array)?.iter().find(|m| m.get("isDefault").and_then(Value::as_bool) == Some(true))?.get("id")?.as_str().map(String::from)
+    });
+    json!({ "availableModels": models, "currentModelId": current })
+}
+
+/// ACP plan entries from `turn/plan/updated`.
+fn plan_entries(p: &Value) -> Vec<Value> {
+    p.get("plan")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            let status = match step.get("status").and_then(Value::as_str) {
+                Some("inProgress") => "in_progress",
+                Some("completed") => "completed",
+                _ => "pending",
+            };
+            json!({ "content": step.get("step"), "priority": "medium", "status": status })
+        })
+        .collect()
+}
+
+/// How `turn/completed` ends the prompt: `None` when it is another turn's.
+fn turn_end(p: &Value, turn_id: Option<&str>) -> Option<RpcResult> {
+    let turn = p.get("turn").cloned().unwrap_or(Value::Null);
+    let id = turn.get("id").and_then(Value::as_str);
+    if turn_id.is_some() && id != turn_id {
+        return None;
+    }
+    Some(match turn.get("status").and_then(Value::as_str) {
+        Some("interrupted") => Ok(json!({ "stopReason": "cancelled" })),
+        Some("failed") => Err(RpcError::internal(turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("Codex failed the turn"))),
+        _ => Ok(json!({ "stopReason": "end_turn" })),
+    })
 }
 
 /// The client's MCP servers as Codex `mcp_servers` config.
@@ -820,11 +938,19 @@ mod tests {
 
     #[test]
     fn modes_map_to_policies() {
-        assert_eq!(policy("bypassPermissions").0, "never");
-        assert_eq!(policy("bypassPermissions").1, json!({ "type": "dangerFullAccess" }));
-        assert_eq!((policy("plan").0, policy("plan").2), ("on-request", "read-only"));
-        assert_eq!((policy("acceptEdits").0, policy("acceptEdits").2), ("on-request", "workspace-write"));
-        assert_eq!(policy("default").0, "untrusted");
+        assert_eq!(policy(Mode::BypassPermissions).0, "never");
+        assert_eq!(policy(Mode::BypassPermissions).1, json!({ "type": "dangerFullAccess" }));
+        assert_eq!((policy(Mode::Plan).0, policy(Mode::Plan).2), ("on-request", "read-only"));
+        assert_eq!((policy(Mode::AcceptEdits).0, policy(Mode::AcceptEdits).2), ("on-request", "workspace-write"));
+        assert_eq!(policy(Mode::Default).0, "untrusted");
+        // codex-acp's preset ids name the same modes.
+        assert_eq!(Mode::parse("full-access"), Some(Mode::BypassPermissions));
+        assert_eq!(Mode::parse("auto"), Some(Mode::AcceptEdits));
+        assert_eq!(Mode::parse("read-only"), Some(Mode::Plan));
+        assert_eq!(Mode::parse("yolo"), None);
+        for mode in [Mode::Default, Mode::AcceptEdits, Mode::Plan, Mode::BypassPermissions] {
+            assert_eq!(Mode::parse(mode.as_str()), Some(mode));
+        }
     }
 
     #[test]

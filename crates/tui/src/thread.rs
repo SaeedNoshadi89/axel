@@ -8,9 +8,15 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use std::path::PathBuf;
 
+use axel_i18n::t;
+
 use crate::attach::parse_dropped_paths;
 use crate::input::TextInput;
 use crate::model::{ItemBody, ItemKind, ItemStatus, RuntimeMode, ThreadData, ThreadItem};
+
+/// Prompts sent from this view kept for ↑ history: the store holds the rest,
+/// and the thread view reads its newest 500 items anyway.
+const SENT_HISTORY_MAX: usize = 500;
 
 /// Command sent to a managed session's host (mirrors `axel_acp::socket::Command`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +234,9 @@ pub struct ThreadView {
     pub attach_sel: usize,
     /// Dim status line under the composer (`sending…`, errors).
     pub status: Option<String>,
+    /// The status reports a failure (shown in red); set with it, by
+    /// [`Self::set_status`] and [`Self::set_error`].
+    pub status_is_error: bool,
     /// Set while a send is in flight to block double submits.
     pub sending: bool,
     /// Selected row while `focus == Queue`.
@@ -269,6 +278,7 @@ impl ThreadView {
             attachments: Vec::new(),
             attach_sel: 0,
             status: None,
+            status_is_error: false,
             sending: false,
             queue_sel: 0,
             sent: Vec::new(),
@@ -307,7 +317,7 @@ impl ThreadView {
             && !self.data.items.iter().any(|it| it.id == *id && is_queued(it))
         {
             self.editing = None;
-            self.set_status("the agent read it before you saved · your text stays: Enter sends it as a new message");
+            self.set_status(t!("the agent read it before you saved · your text stays: Enter sends it as a new message"));
         }
         self.clamp_queue_sel();
         let rows = self.rows();
@@ -431,7 +441,7 @@ impl ThreadView {
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => match self.mode_session() {
                 Some(s) => ThreadAction::OpenLog(s.id.clone()),
                 None => {
-                    self.set_status("no agent session to show");
+                    self.set_status(t!("no agent session to show"));
                     ThreadAction::None
                 }
             },
@@ -532,6 +542,13 @@ impl ThreadView {
 
     pub fn set_status(&mut self, s: impl Into<String>) {
         self.status = Some(s.into());
+        self.status_is_error = false;
+    }
+
+    /// A status that reports a failure: the footer shows it in red.
+    pub fn set_error(&mut self, s: impl Into<String>) {
+        self.status = Some(s.into());
+        self.status_is_error = true;
     }
 
     /// Called by the app with the host's reply to the last send.
@@ -583,21 +600,28 @@ impl ThreadView {
             }
             _ => {}
         }
+        // An edit read before it was saved isn't an error: the text stays.
+        let was_edit = matches!(in_flight, Some(InFlight::Edit { .. }));
         self.status = match reply {
             Ok(SendReply::Ok) => match in_flight {
-                Some(InFlight::Edit { .. }) => Some("edited".into()),
+                Some(InFlight::Edit { .. }) => Some(t!("edited").into()),
                 _ => None,
             },
-            Ok(SendReply::Queued { .. }) => Some(if self.queued().len() > 1 { format!("queued ({})", self.queued().len()) } else { "queued · runs when the turn ends · ^S interrupts for it".into() }),
-            Ok(SendReply::Steering { .. }) => Some("sent into the turn · read at its next step · ⌥↑ edits it until then".into()),
-            Ok(SendReply::Status { state, turn, pending }) => Some(format!("{state} · turn {turn} · {pending} pending")),
-            Ok(SendReply::Error { message }) => Some(match in_flight {
-                Some(InFlight::Dequeue { .. }) => format!("error: {message} · text kept in the composer"),
-                Some(InFlight::Edit { .. }) => format!("{message} · your text stays: Enter sends it as a new message"),
-                _ => format!("error: {message}"),
+            Ok(SendReply::Queued { .. }) => Some(if self.queued().len() > 1 {
+                t!("queued ({n})", n = self.queued().len())
+            } else {
+                t!("queued · runs when the turn ends · ^S interrupts for it").into()
             }),
-            Err(e) => Some(format!("error: {e}")),
+            Ok(SendReply::Steering { .. }) => Some(t!("sent into the turn · read at its next step · ⌥↑ edits it until then").into()),
+            Ok(SendReply::Status { state, turn, pending }) => Some(t!("{state} · turn {turn} · {pending} pending", state = state, turn = turn, pending = pending)),
+            Ok(SendReply::Error { message }) => Some(match in_flight {
+                Some(InFlight::Dequeue { .. }) => t!("error: {message} · text kept in the composer", message = message),
+                Some(InFlight::Edit { .. }) => t!("{message} · your text stays: Enter sends it as a new message", message = message),
+                _ => t!("error: {message}", message = message),
+            }),
+            Err(e) => Some(t!("error: {message}", message = e)),
         };
+        self.status_is_error = failed && !was_edit;
         self.clamp_queue_sel();
     }
 
@@ -647,19 +671,11 @@ impl ThreadView {
                 };
             }
             KeyCode::Up if self.focus == Focus::Composer => {
-                if key.modifiers.contains(KeyModifiers::SUPER) {
-                    self.composer.text_start();
-                } else if !self.composer.screen_line(self.composer_width, true) {
-                    self.history_step(true);
-                }
+                self.composer_vertical(key, true);
                 return ThreadAction::None;
             }
             KeyCode::Down if self.focus == Focus::Composer => {
-                if key.modifiers.contains(KeyModifiers::SUPER) {
-                    self.composer.text_end();
-                } else if !self.composer.screen_line(self.composer_width, false) {
-                    self.history_step(false);
-                }
+                self.composer_vertical(key, false);
                 return ThreadAction::None;
             }
             KeyCode::Up if self.focus != Focus::Queue => return self.move_cursor(-1),
@@ -669,30 +685,7 @@ impl ThreadView {
             // Shift+Tab cycles the live session's runtime mode (Claude Code's binding).
             KeyCode::BackTab => return self.cycle_mode(),
             KeyCode::Tab => {
-                // Composer → attachments → queue → timeline, skipping empty stops.
-                let order = [Focus::Composer, Focus::Attachments, Focus::Queue, Focus::Timeline];
-                let has_queue = !self.queued().is_empty();
-                let compose_only = self.compose_only;
-                let available = |f: Focus| match f {
-                    Focus::Attachments => !self.attachments.is_empty(),
-                    Focus::Queue => has_queue,
-                    Focus::Timeline => !compose_only,
-                    Focus::Composer => true,
-                };
-                let cur = order.iter().position(|f| *f == self.focus).unwrap_or(0);
-                let mut i = cur;
-                loop {
-                    i = (i + 1) % order.len();
-                    if available(order[i]) {
-                        break;
-                    }
-                }
-                self.focus = order[i];
-                if compose_only && self.focus == Focus::Composer && !has_queue && self.attachments.is_empty() {
-                    self.set_status("nothing to browse · scroll the message pane or click a tool-call link");
-                }
-                self.attach_sel = self.attach_sel.min(self.attachments.len().saturating_sub(1));
-                self.clamp_queue_sel();
+                self.next_focus();
                 return ThreadAction::None;
             }
             KeyCode::Char(' ') if shift && self.focus == Focus::Timeline => {
@@ -707,6 +700,38 @@ impl ThreadView {
             Focus::Queue => self.key_queue(key),
             Focus::Timeline => self.key_timeline(key),
         }
+    }
+
+    /// ↑/↓ in the composer: between its lines, and past the first or last
+    /// (or while browsing) through prompt history; with ⌘, to the start or end.
+    fn composer_vertical(&mut self, key: KeyEvent, up: bool) {
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            if up { self.composer.text_start() } else { self.composer.text_end() }
+        } else if !self.composer.screen_line(self.composer_width, up) {
+            self.history_step(up);
+        }
+    }
+
+    /// Tab: composer → attachments → queue → timeline, skipping empty stops.
+    fn next_focus(&mut self) {
+        let order = [Focus::Composer, Focus::Attachments, Focus::Queue, Focus::Timeline];
+        let has_queue = !self.queued().is_empty();
+        let compose_only = self.compose_only;
+        let available = |f: Focus| match f {
+            Focus::Attachments => !self.attachments.is_empty(),
+            Focus::Queue => has_queue,
+            Focus::Timeline => !compose_only,
+            Focus::Composer => true,
+        };
+        let cur = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        // Bounded: the composer is always available, so a lap finds a stop.
+        let i = (1..=order.len()).map(|step| (cur + step) % order.len()).find(|&i| available(order[i])).expect("the composer is always available");
+        self.focus = order[i];
+        if compose_only && self.focus == Focus::Composer && !has_queue && self.attachments.is_empty() {
+            self.set_status(t!("nothing to browse · scroll the message pane or click a tool-call link"));
+        }
+        self.attach_sel = self.attach_sel.min(self.attachments.len().saturating_sub(1));
+        self.clamp_queue_sel();
     }
 
     fn key_queue(&mut self, key: KeyEvent) -> ThreadAction {
@@ -770,7 +795,7 @@ impl ThreadView {
             return ThreadAction::None;
         }
         let Some(i) = self.data.live_sessions.iter().position(|s| s.managed) else {
-            self.set_status("no managed session to switch modes on");
+            self.set_status(t!("no managed session to switch modes on"));
             return ThreadAction::None;
         };
         let s = &mut self.data.live_sessions[i];
@@ -800,6 +825,7 @@ impl ThreadView {
         let last = n as i64 - 1;
         let next = (self.cursor as i64 + delta as i64).clamp(0, last);
         self.cursor = next as usize;
+        assert!(self.cursor < n, "the cursor is on a row");
         self.follow = next == last;
     }
 
@@ -813,7 +839,7 @@ impl ThreadView {
         self.sending = true;
         self.in_flight = Some(InFlight::Other);
         self.follow = true;
-        self.set_status("sending it now…");
+        self.set_status(t!("sending it now…"));
         ThreadAction::Send { session_id, cmd: SendCommand::Steer { item_id } }
     }
 
@@ -839,7 +865,7 @@ impl ThreadView {
         self.clamp_queue_sel();
         self.sending = true;
         self.in_flight = Some(InFlight::Dequeue { text });
-        self.set_status(if edit { "editing queued message…" } else { "removing…" });
+        self.set_status(if edit { t!("editing queued message…") } else { t!("removing…") });
         ThreadAction::Send { session_id: it.session_id, cmd: SendCommand::Dequeue { item_id: it.id } }
     }
 
@@ -847,7 +873,7 @@ impl ThreadView {
     /// stays queued (it can still be read meanwhile) until Enter saves it.
     fn edit_queued(&mut self, i: usize) -> ThreadAction {
         if !self.composer.is_empty() {
-            self.set_status("composer not empty · send or clear it first");
+            self.set_status(t!("composer not empty · send or clear it first"));
             return ThreadAction::None;
         }
         let it = &self.data.items[i];
@@ -858,7 +884,7 @@ impl ThreadView {
         self.editing = Some(it.id.clone());
         self.composer.set_text(&text);
         self.focus = Focus::Composer;
-        self.set_status("editing a message not read yet · Enter saves · Esc cancels");
+        self.set_status(t!("editing a message not read yet · Enter saves · Esc cancels"));
         ThreadAction::None
     }
 
@@ -871,7 +897,7 @@ impl ThreadView {
         let text = self.composer.text();
         if text.trim().is_empty() {
             self.editing = Some(item_id);
-            self.set_status("empty · Esc cancels, or remove the message from the queue (Tab, x)");
+            self.set_status(t!("empty · Esc cancels, or remove the message from the queue (Tab, x)"));
             return ThreadAction::None;
         }
         let Some(session_id) = self.data.items.iter().find(|it| it.id == item_id).map(|it| it.session_id.clone()) else {
@@ -880,7 +906,7 @@ impl ThreadView {
         self.composer.clear();
         self.sending = true;
         self.in_flight = Some(InFlight::Edit { item_id: item_id.clone(), text: text.clone() });
-        self.set_status("saving…");
+        self.set_status(t!("saving…"));
         ThreadAction::Send { session_id, cmd: SendCommand::Edit { item_id, text } }
     }
 
@@ -935,7 +961,7 @@ impl ThreadView {
             KeyCode::Esc if self.editing.is_some() => {
                 self.editing = None;
                 self.composer.clear();
-                self.set_status("edit cancelled · the message is as it was");
+                self.set_status(t!("edit cancelled · the message is as it was"));
                 ThreadAction::None
             }
             // ^S: send now, interrupting the running turn; with an empty composer,
@@ -995,7 +1021,7 @@ impl ThreadView {
             KeyCode::Char('l') => match self.log_target() {
                 Some(sid) => ThreadAction::OpenLog(sid),
                 None => {
-                    self.set_status("no session to show a log for");
+                    self.set_status(t!("no session to show a log for"));
                     ThreadAction::None
                 }
             },
@@ -1056,6 +1082,7 @@ impl ThreadView {
         let last = rows.len() as i64 - 1;
         let next = (self.cursor as i64 + delta as i64).clamp(0, last);
         self.cursor = next as usize;
+        assert!(self.cursor < rows.len(), "the cursor is on a row");
         self.follow = next == last;
         ThreadAction::None
     }
@@ -1178,6 +1205,9 @@ impl ThreadView {
             if !t.is_empty() {
                 v.sent.retain(|s| *s != t);
                 v.sent.push(t);
+                if v.sent.len() > SENT_HISTORY_MAX {
+                    v.sent.remove(0);
+                }
             }
             v.hist_pos = None;
             v.hist_draft.clear();
@@ -1191,11 +1221,11 @@ impl ThreadView {
                 let attachments = std::mem::take(&mut self.attachments);
                 self.sending = true;
                 self.set_status(if redirect {
-                    "declining · redirecting…"
+                    t!("declining · redirecting…")
                 } else if steer {
-                    "interrupting…"
+                    t!("interrupting…")
                 } else {
-                    "sending…"
+                    t!("sending…")
                 });
                 self.follow = true;
                 self.in_flight = Some(InFlight::Prompt {
@@ -1217,12 +1247,12 @@ impl ThreadView {
                     attachments: attachments.clone(),
                 });
                 self.sending = true;
-                self.set_status(format!("summoning @{agent}…"));
+                self.set_status(t!("summoning @{agent}…", agent = agent));
                 self.follow = true;
                 ThreadAction::Summon { thread_id: self.thread_id.clone(), agent, text, attachments }
             }
             Dispatch::NoTarget => {
-                self.set_status("no agent on this thread yet · start with @name");
+                self.set_status(t!("no agent on this thread yet · start with @name"));
                 ThreadAction::None
             }
         }
@@ -1230,70 +1260,72 @@ impl ThreadView {
 
     pub fn help(&self) -> Vec<(&'static str, &'static str)> {
         match self.focus {
-            Focus::Composer if !self.mention_options().is_empty() => vec![("↑↓", "pick"), ("Tab", "mention"), ("Esc", "dismiss")],
+            Focus::Composer if !self.mention_options().is_empty() => vec![("↑↓", t!("pick")), ("Tab", t!("mention")), ("Esc", t!("dismiss"))],
             Focus::Composer => {
                 let queued = !self.queued().is_empty();
                 if self.editing.is_some() {
-                    return vec![("Enter", "save edit"), ("Esc", "cancel edit"), ("⇧Enter", "new line")];
+                    return vec![("Enter", t!("save edit")), ("Esc", t!("cancel edit")), ("⇧Enter", t!("new line"))];
                 }
                 let enter = if self.awaiting_answer() {
-                    "decline & redirect"
+                    t!("decline & redirect")
                 } else if self.is_busy() {
                     // Into the running turn: the agent reads it at its next step.
-                    "send into turn"
+                    t!("send into turn")
                 } else {
-                    "send"
+                    t!("send")
                 };
                 let mut v = vec![("Enter", enter)];
                 if self.is_busy() {
-                    v.push(("^S", "interrupt & send"));
+                    v.push(("^S", t!("interrupt & send")));
                 } else if queued {
-                    v.push(("^S", "send queued"));
+                    v.push(("^S", t!("send queued")));
                 }
                 if queued && self.composer.is_empty() {
-                    v.push(("⌥↑", "edit"));
+                    v.push(("⌥↑", t!("edit")));
                 }
                 if self.compose_only && self.pending_choice().is_some() && self.composer.is_empty() {
-                    v[0] = ("Enter", "answer");
-                    v.insert(1, ("1-9", "pick"));
-                    v.insert(2, ("↑↓", "choose"));
+                    v[0] = ("Enter", t!("answer"));
+                    v.insert(1, ("1-9", t!("pick")));
+                    v.insert(2, ("↑↓", t!("choose")));
                 } else if !self.composer.is_empty() {
-                    v.push(("⇧Enter", "new line"));
+                    v.push(("⇧Enter", t!("new line")));
                 } else {
-                    v.push(("↑↓", "history"));
+                    v.push(("↑↓", t!("history")));
                 }
                 if self.compose_only && self.mode_session().is_some() {
-                    v.push(("^L", "log"));
+                    v.push(("^L", t!("log")));
                 }
                 if !self.compose_only {
-                    v.push(("PgUp", "scroll"));
+                    v.push(("PgUp", t!("scroll")));
                 }
                 if !self.attachments.is_empty() {
-                    v.push(("Tab", "attachments"));
+                    v.push(("Tab", t!("attachments")));
                 } else if queued {
-                    v.push(("Tab", "queue"));
+                    v.push(("Tab", t!("queue")));
                 } else if !self.compose_only {
-                    v.push(("Tab", "timeline keys"));
+                    v.push(("Tab", t!("timeline keys")));
                 }
-                v.push(("Esc", if self.compose_only { "close" } else { "dashboard" }));
+                v.push(("Esc", if self.compose_only { t!("close") } else { t!("dashboard") }));
                 v
             }
-            Focus::Attachments => vec![("←→", "select"), ("⌫", "remove"), ("Esc", "back")],
-            Focus::Queue => vec![("↑↓", "select"), ("Enter", "send now"), ("e", "edit"), ("x", "remove"), ("Esc", "back")],
+            Focus::Attachments => vec![("←→", t!("select")), ("⌫", t!("remove")), ("Esc", t!("back"))],
+            Focus::Queue => vec![("↑↓", t!("select")), ("Enter", t!("send now")), ("e", t!("edit")), ("x", t!("remove")), ("Esc", t!("back"))],
             Focus::Timeline => vec![
-                ("Space", "expand"),
-                ("⇧Space", "fold all"),
-                ("Enter", "answer"),
-                ("l", "log"),
-                ("g/G", "top/bottom"),
-                ("Esc", "dashboard"),
+                ("Space", t!("expand")),
+                ("⇧Space", t!("fold all")),
+                ("Enter", t!("answer")),
+                ("l", t!("log")),
+                ("g/G", t!("top/bottom")),
+                ("Esc", t!("dashboard")),
             ],
         }
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// A thread to render in tests: this crate's and its integration tests
+/// (`tests/zh_hans.rs`), which can't see `cfg(test)` items.
+#[doc(hidden)]
+pub mod fixtures {
     use super::*;
     use crate::model::{ChoiceOption, LiveSession};
     use axel_store::AgentColor;

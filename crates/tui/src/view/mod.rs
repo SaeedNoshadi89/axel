@@ -37,6 +37,46 @@ pub fn help_line(items: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// [`help_line`] in `width` cells: the last keys go first, so no action
+/// is cut in half (Chinese key help is wider than English).
+pub fn help_line_fit(items: &[(&str, &str)], width: usize) -> Line<'static> {
+    let mut shown = items.len();
+    let mut line = help_line(items);
+    while shown > 0 && line.width() > width {
+        shown -= 1;
+        line = help_line(&items[..shown]);
+    }
+    debug_assert!(line.width() <= width || shown == 0, "a fitted help line fits");
+    line
+}
+
+/// A translated sentence whose parts are styled apart: the text of
+/// `template` in `base`, each `{name}` in it replaced by its span from
+/// `parts`. A language puts the parts where its word order wants them.
+pub fn template_spans(template: &str, base: Style, parts: &[(&str, Span<'static>)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let part = after.find('}').and_then(|close| parts.iter().find(|(name, _)| *name == &after[..close]).map(|(_, span)| (close, span)));
+        let Some((close, span)) = part else {
+            // Not a placeholder: a brace like any other character.
+            spans.push(Span::styled(rest[..open + 1].to_string(), base));
+            rest = after;
+            continue;
+        };
+        if open > 0 {
+            spans.push(Span::styled(rest[..open].to_string(), base));
+        }
+        spans.push(span.clone());
+        rest = &after[close + 1..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
+    }
+    spans
+}
+
 /// Attachment chips as spans: dim, with the selected one inverted and marked `✕`.
 pub fn chips_spans(attachments: &[std::path::PathBuf], width: usize, selected: Option<usize>) -> Vec<Span<'static>> {
     let (parts, hidden) = crate::attach::chip_parts(attachments, width, selected);
@@ -806,6 +846,16 @@ mod tests {
         assert_eq!(wrap("x\ny", 10), vec!["x", "y"]);
         assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrap("", 4), vec![""]);
+        // Chinese: two cells a character, broken anywhere, never split.
+        assert_eq!(wrap("修复登录错误", 6), vec!["修复登", "录错误"]);
+        assert_eq!(wrap("修复登录错误", 5), vec!["修复", "登录", "错误"]);
+        assert_eq!(wrap("atlas 提问：要用哪个", 12), vec!["atlas 提问：", "要用哪个"]);
+        assert_eq!(wrap("ok 修复登录", 7), vec!["ok 修复", "登录"], "CJK runs on from the row it starts on");
+        for w in 1..20 {
+            for l in wrap("请帮我修复 login 页面的错误，并且 add tests", w) {
+                assert!(crate::util::text_width(&l) <= w.max(2), "{w}: {l:?}");
+            }
+        }
         let items = crate::thread::fixtures::items();
         let tools: Vec<&crate::model::ThreadItem> = items[2..7].iter().collect();
         assert_eq!(fold_summary(&tools, 200), "Read auth.rs, login.rs, search for “session_token”, edit login.rs, run tests");

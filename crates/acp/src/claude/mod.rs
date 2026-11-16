@@ -36,7 +36,7 @@
 pub mod tools;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,9 +44,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axel_i18n::t;
 use serde_json::{Map, Value, json};
 
-use crate::agent_rpc::{Client, Lines, RpcError, RpcResult};
+use crate::agent_rpc::{Client, Lines, RpcError, RpcResult, bounded_lines};
 use crate::usage::{ClaudeMeter, claude_limits, limits_params};
 
 /// One Claude Code process and what we know about its conversation.
@@ -61,10 +62,10 @@ struct Session {
     next_control: AtomicU64,
     /// Control requests Claude withdrew (`control_cancel_request`).
     withdrawn: Mutex<HashSet<String>>,
-    permission_mode: Mutex<String>,
+    permission_mode: Mutex<PermissionMode>,
     cancelled: AtomicBool,
     /// `tool_use` blocks by id, for naming their results.
-    tool_uses: Mutex<HashMap<String, Value>>,
+    tool_uses: Mutex<ToolUses>,
     /// Tool uses whose PostToolUse hook should send the tool response.
     hooked: Mutex<HashSet<String>>,
     /// The turn's steering: whether a prompt is running, and the messages
@@ -91,7 +92,8 @@ impl Session {
         let n = self.next_control.fetch_add(1, Ordering::SeqCst);
         let request_id = format!("axel-{n}");
         let (tx, rx) = mpsc::channel();
-        self.controls.lock().expect("controls lock").insert(request_id.clone(), tx);
+        let previous = self.controls.lock().expect("controls lock").insert(request_id.clone(), tx);
+        debug_assert!(previous.is_none(), "control request ids come from a counter: never reused");
         self.stdin.send(&json!({ "request_id": request_id, "type": "control_request", "request": request }));
         let resp = rx.recv_timeout(timeout).map_err(|_| {
             self.controls.lock().expect("controls lock").remove(&request_id);
@@ -104,12 +106,47 @@ impl Session {
         }
     }
 
-    fn mode(&self) -> String {
-        self.permission_mode.lock().expect("mode lock").clone()
+    fn mode(&self) -> PermissionMode {
+        *self.permission_mode.lock().expect("mode lock")
     }
 
-    fn set_mode(&self, mode: &str) {
-        *self.permission_mode.lock().expect("mode lock") = mode.to_string();
+    fn set_mode(&self, mode: PermissionMode) {
+        *self.permission_mode.lock().expect("mode lock") = mode;
+    }
+}
+
+/// Claude Code's permission modes (`--permission-mode`, `set_permission_mode`),
+/// which are also this adapter's ACP session modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionMode {
+    Default,
+    AcceptEdits,
+    Plan,
+    DontAsk,
+    BypassPermissions,
+}
+
+impl PermissionMode {
+    /// Claude Code's name, and the ACP mode id.
+    fn as_str(self) -> &'static str {
+        match self {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Plan => "plan",
+            PermissionMode::DontAsk => "dontAsk",
+            PermissionMode::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    fn parse(id: &str) -> Option<PermissionMode> {
+        Some(match id {
+            "default" => PermissionMode::Default,
+            "acceptEdits" => PermissionMode::AcceptEdits,
+            "plan" => PermissionMode::Plan,
+            "dontAsk" => PermissionMode::DontAsk,
+            "bypassPermissions" => PermissionMode::BypassPermissions,
+            _ => return None,
+        })
     }
 }
 
@@ -118,6 +155,8 @@ impl Session {
     /// relay threads hold the session until Claude's stdout closes, so a
     /// `Drop` alone would wait on the very process it is meant to end.
     fn kill_child(&self) {
+        // Claude may have exited already (kill then fails, and wait returns
+        // its status): either way it is gone, which is all that is wanted.
         if let Ok(mut c) = self.child.lock() {
             let _ = c.kill();
             let _ = c.wait();
@@ -140,12 +179,26 @@ struct Agent {
 /// The `PostToolUse` hook callback id we register with Claude.
 const POST_TOOL_USE_HOOK: &str = "hook_0";
 
+/// How long Claude has to answer a control request (a mode or model
+/// switch, an interrupt): it answers at once unless it is stuck.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long Claude has to start up and answer `initialize`: it loads its
+/// settings, plugins and MCP servers first.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long withdrawing a steered message may hold up the owner's edit.
+const WITHDRAW_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the idle relay looks for messages Claude sent on its own.
+const IDLE_RELAY_POLL: Duration = Duration::from_millis(50);
+/// The slash commands go out this long after the session reply, so the
+/// client knows the session before it hears about it.
+const COMMANDS_DELAY: Duration = Duration::from_millis(20);
+
 /// Run the agent on stdin/stdout until the client closes stdin.
 pub fn serve_stdio() -> anyhow::Result<()> {
     let client = Arc::new(Client::stdio());
     let agent = Arc::new(Agent { client: client.clone(), sessions: Mutex::new(HashMap::new()), client_caps: Mutex::new(Value::Null) });
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
+    for line in bounded_lines(stdin.lock(), "axel claude-acp") {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
@@ -225,19 +278,7 @@ impl Agent {
                 Ok(json!({ "modes": reply.get("modes"), "models": reply.get("models") }))
             }
             "session/prompt" => self.prompt(&params),
-            "session/cancel" => {
-                let s = self.session(&params)?;
-                s.cancelled.store(true, Ordering::SeqCst);
-                // Messages sent into the turn and not taken in yet would start a
-                // turn of their own after the interrupt: withdraw them, and tell
-                // the host, which keeps them queued.
-                let withdrawn = self.withdraw_all(&s);
-                if !withdrawn.is_empty() {
-                    self.client.notify("_axel/unsteered", json!({ "sessionId": s.id, "messageIds": withdrawn }));
-                }
-                s.control(json!({ "subtype": "interrupt" }), Duration::from_secs(30)).map_err(RpcError::invalid)?;
-                Ok(Value::Null)
-            }
+            "session/cancel" => self.cancel(&params),
             "_axel/steer" => self.steer(&params),
             "_axel/unsteer" => {
                 let s = self.session(&params)?;
@@ -247,24 +288,34 @@ impl Agent {
             "session/set_model" => {
                 let s = self.session(&params)?;
                 let model = params.get("modelId").and_then(Value::as_str).unwrap_or("");
-                s.control(json!({ "subtype": "set_model", "model": model }), Duration::from_secs(30)).map_err(RpcError::invalid)?;
+                s.control(json!({ "subtype": "set_model", "model": model }), CONTROL_TIMEOUT).map_err(RpcError::invalid)?;
                 Ok(json!({}))
             }
             "session/set_mode" => {
                 let s = self.session(&params)?;
-                let mode = params.get("modeId").and_then(Value::as_str).unwrap_or("");
-                match mode {
-                    "default" | "acceptEdits" | "bypassPermissions" | "dontAsk" | "plan" => {
-                        s.set_mode(mode);
-                        s.control(json!({ "subtype": "set_permission_mode", "mode": mode }), Duration::from_secs(30))
-                            .map_err(|e| RpcError::invalid(if e.is_empty() { "Invalid Mode".into() } else { e }))?;
-                        Ok(json!({}))
-                    }
-                    _ => Err(RpcError::invalid("Invalid Mode")),
-                }
+                let mode = params.get("modeId").and_then(Value::as_str).and_then(PermissionMode::parse).ok_or_else(|| RpcError::invalid("Invalid Mode"))?;
+                s.set_mode(mode);
+                s.control(json!({ "subtype": "set_permission_mode", "mode": mode.as_str() }), CONTROL_TIMEOUT)
+                    .map_err(|e| RpcError::invalid(if e.is_empty() { "Invalid Mode".into() } else { e }))?;
+                Ok(json!({}))
             }
             other => Err(RpcError::not_found(other)),
         }
+    }
+
+    /// `session/cancel`: interrupt Claude's turn.
+    fn cancel(&self, params: &Value) -> RpcResult {
+        let s = self.session(params)?;
+        s.cancelled.store(true, Ordering::SeqCst);
+        // Messages sent into the turn and not taken in yet would start a
+        // turn of their own after the interrupt: withdraw them, and tell
+        // the host, which keeps them queued.
+        let withdrawn = self.withdraw_all(&s);
+        if !withdrawn.is_empty() {
+            self.client.notify("_axel/unsteered", json!({ "sessionId": s.id, "messageIds": withdrawn }));
+        }
+        s.control(json!({ "subtype": "interrupt" }), CONTROL_TIMEOUT).map_err(RpcError::invalid)?;
+        Ok(Value::Null)
     }
 
     fn session(&self, params: &Value) -> Result<Arc<Session>, RpcError> {
@@ -276,7 +327,7 @@ impl Agent {
     fn send_commands_later(&self, session: String, commands: Value) {
         let client = self.client.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(COMMANDS_DELAY);
             client.update(&session, json!({ "sessionUpdate": "available_commands_update", "availableCommands": available_commands(&commands) }));
         });
     }
@@ -284,160 +335,51 @@ impl Agent {
     /// Start Claude Code for a session: `createSession` in the adapter.
     fn create_session(self: &Arc<Self>, params: &Value, resume: Option<String>) -> Result<(String, Value, Value), RpcError> {
         let cwd = PathBuf::from(params.get("cwd").and_then(Value::as_str).unwrap_or("."));
-        let session_id = resume.clone().unwrap_or_else(uuid_v4);
+        let session_id = resume.clone().unwrap_or_else(new_uuid);
         let meta = params.get("_meta").cloned().unwrap_or(Value::Null);
         let user_options = meta.pointer("/claudeCode/options").cloned().unwrap_or(Value::Null);
+        let mcp = mcp_servers(params, &user_options);
+        let args = claude_args(params, &user_options, &mcp, resume.as_deref(), &session_id);
+        let session = self.start_claude(&cwd, &args, &session_id, resume.is_some())?;
+        let init = session.control(initialize_request(&meta), INITIALIZE_TIMEOUT).map_err(RpcError::internal)?;
+        let models = select_model(&session, &init, &cwd);
+        let reply = json!({
+            "sessionId": session_id,
+            "models": models,
+            "modes": { "currentModeId": PermissionMode::Default.as_str(), "availableModes": available_modes() },
+        });
+        let commands = init.get("commands").cloned().unwrap_or(Value::Array(vec![]));
+        Ok((session_id, reply, commands))
+    }
 
-        // MCP servers: the client's, then any from `_meta.claudeCode.options.mcpServers`.
-        let mut mcp = user_options.get("mcpServers").and_then(Value::as_object).cloned().unwrap_or_default();
-        for server in params.get("mcpServers").and_then(Value::as_array).into_iter().flatten() {
-            let Some(name) = server.get("name").and_then(Value::as_str) else { continue };
-            let pairs = |k: &str| -> Option<Value> {
-                let a = server.get(k)?.as_array()?;
-                Some(Value::Object(
-                    a.iter()
-                        .filter_map(|e| Some((e.get("name")?.as_str()?.to_string(), e.get("value").cloned().unwrap_or(Value::Null))))
-                        .collect(),
-                ))
-            };
-            let entry = match server.get("type").and_then(Value::as_str) {
-                Some(kind) => json!({ "type": kind, "url": server.get("url"), "headers": pairs("headers") }),
-                None => json!({ "type": "stdio", "command": server.get("command"), "args": server.get("args"), "env": pairs("env") }),
-            };
-            mcp.insert(name.to_string(), strip_nulls(entry));
-        }
-
-        // The system prompt: Claude Code's own, plus an appended part, or a replacement.
-        let (system_prompt, append) = match meta.get("systemPrompt") {
-            Some(Value::String(s)) => (Some(s.clone()), None),
-            Some(v) => (None, v.get("append").and_then(Value::as_str).map(String::from)),
-            None => (None, None),
-        };
-
-        // `--replay-user-messages`: Claude echoes each user message as it takes
-        // it in, which is how a steer is known to have landed.
-        let mut args: Vec<String> =
-            ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--replay-user-messages"].map(String::from).to_vec();
-        if let Some(n) = std::env::var("MAX_THINKING_TOKENS").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
-            args.extend(["--max-thinking-tokens".into(), n.to_string()]);
-        }
-        args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
-        // The agent's reasoning effort, from the host (`_meta.axel.effort`).
-        if let Some(effort) = crate::host::meta_effort(params).and_then(|e| axel_store::Harness::Claude.native_effort(e)) {
-            args.extend(["--effort".into(), effort.into()]);
-        }
-        if let Some(r) = &resume {
-            args.extend(["--resume".into(), r.clone()]);
-        }
-        // AskUserQuestion stays on: each question is asked as a permission
-        // request whose options are the choices (see `ask_questions`).
-        args.extend(["--tools".into(), "default".into()]);
-        if !mcp.is_empty() {
-            args.extend(["--mcp-config".into(), json!({ "mcpServers": mcp }).to_string()]);
-        }
-        args.extend(["--setting-sources".into(), "user,project,local".into()]);
-        args.extend(["--permission-mode".into(), "default".into()]);
-        if allow_bypass() {
-            args.push("--allow-dangerously-skip-permissions".into());
-        }
-        args.push("--include-partial-messages".into());
-        if resume.is_none() {
-            args.extend(["--session-id".into(), session_id.clone()]);
-        }
-        for (k, v) in user_options.get("extraArgs").and_then(Value::as_object).into_iter().flatten() {
-            args.push(format!("--{k}"));
-            match v {
-                Value::Null => {}
-                Value::String(s) => args.push(s.clone()),
-                other => args.push(other.to_string()),
-            }
-        }
-
+    /// Spawn Claude Code with `args` in `cwd`, and the threads that read it.
+    fn start_claude(self: &Arc<Self>, cwd: &Path, args: &[String], session_id: &str, resumed: bool) -> Result<Arc<Session>, RpcError> {
         let exe = std::env::var("CLAUDE_CODE_EXECUTABLE").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "claude".into());
-        let mut cmd = if [".js", ".mjs", ".cjs"].iter().any(|ext| exe.ends_with(ext)) {
-            let mut c = Command::new("node");
-            c.arg(&exe);
-            c
-        } else {
-            Command::new(&exe)
-        };
-        cmd.args(&args).current_dir(&cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
-        if std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_none() {
-            cmd.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
-        }
-        cmd.env_remove("NODE_OPTIONS");
-        if std::env::var_os("DEBUG_CLAUDE_AGENT_SDK").is_some() {
-            cmd.env("DEBUG", "1");
-        } else {
-            cmd.env_remove("DEBUG");
-        }
+        let mut cmd = claude_command(&exe);
+        cmd.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
         let mut child = cmd.spawn().map_err(|e| RpcError::internal(format!("starting {exe}: {e}")))?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
+        let stdin = child.stdin.take().expect("stdin was set to piped above");
+        let stdout = child.stdout.take().expect("stdout was set to piped above");
         let (tx, rx) = mpsc::channel();
         let session = Arc::new(Session {
-            id: session_id.clone(),
+            id: session_id.to_string(),
             stdin: Lines::new(stdin),
             child: Mutex::new(child),
             messages: Mutex::new(rx),
             controls: Mutex::new(HashMap::new()),
             next_control: AtomicU64::new(0),
             withdrawn: Mutex::new(HashSet::new()),
-            permission_mode: Mutex::new("default".into()),
+            permission_mode: Mutex::new(PermissionMode::Default),
             cancelled: AtomicBool::new(false),
-            tool_uses: Mutex::new(HashMap::new()),
+            tool_uses: Mutex::new(ToolUses::default()),
             hooked: Mutex::new(HashSet::new()),
             steering: Mutex::new(Steering::default()),
-            meter: Mutex::new(if resume.is_some() { ClaudeMeter::resumed() } else { ClaudeMeter::default() }),
+            meter: Mutex::new(if resumed { ClaudeMeter::resumed() } else { ClaudeMeter::default() }),
         });
         self.spawn_reader(session.clone(), stdout, tx);
         self.spawn_idle_relay(session.clone());
-        self.sessions.lock().expect("sessions lock").insert(session_id.clone(), session.clone());
-
-        let mut init = json!({
-            "subtype": "initialize",
-            "hooks": { "PostToolUse": [{ "hookCallbackIds": [POST_TOOL_USE_HOOK] }] }
-        });
-        if let Some(sp) = system_prompt {
-            init["systemPrompt"] = Value::String(sp);
-        }
-        if let Some(a) = append {
-            init["appendSystemPrompt"] = Value::String(a);
-        }
-        let init = session.control(init, Duration::from_secs(120)).map_err(RpcError::internal)?;
-
-        // The model: the settings' `model` when it names one Claude offers, else the first.
-        let models = init.get("models").and_then(Value::as_array).cloned().unwrap_or_default();
-        let wanted = settings_model(&cwd);
-        let current = wanted
-            .as_deref()
-            .and_then(|want| models.iter().find(|m| model_matches(m, want)))
-            .or_else(|| models.first())
-            .cloned();
-        if let Some(value) = current.as_ref().and_then(|m| m.get("value")).and_then(Value::as_str) {
-            let _ = session.control(json!({ "subtype": "set_model", "model": value }), Duration::from_secs(30));
-        }
-        let models_reply = json!({
-            "availableModels": models.iter().map(|m| json!({ "modelId": m.get("value"), "name": m.get("displayName"), "description": m.get("description") })).collect::<Vec<_>>(),
-            "currentModelId": current.as_ref().and_then(|m| m.get("value")),
-        });
-
-        let mut modes = vec![
-            json!({ "id": "default", "name": "Default", "description": "Standard behavior, prompts for dangerous operations" }),
-            json!({ "id": "acceptEdits", "name": "Accept Edits", "description": "Auto-accept file edit operations" }),
-            json!({ "id": "plan", "name": "Plan Mode", "description": "Planning mode, no actual tool execution" }),
-            json!({ "id": "dontAsk", "name": "Don't Ask", "description": "Don't prompt for permissions, deny if not pre-approved" }),
-        ];
-        if allow_bypass() {
-            modes.push(json!({ "id": "bypassPermissions", "name": "Bypass Permissions", "description": "Bypass all permission checks" }));
-        }
-        let reply = json!({
-            "sessionId": session_id,
-            "models": models_reply,
-            "modes": { "currentModeId": "default", "availableModes": modes },
-        });
-        let commands = init.get("commands").cloned().unwrap_or(Value::Array(vec![]));
-        Ok((session_id, reply, commands))
+        self.sessions.lock().expect("sessions lock").insert(session_id.to_string(), session.clone());
+        Ok(session)
     }
 
     /// Read Claude's stdout: control traffic is answered here, the rest goes
@@ -445,7 +387,7 @@ impl Agent {
     fn spawn_reader(self: &Arc<Self>, session: Arc<Session>, stdout: std::process::ChildStdout, tx: Sender<Value>) {
         let agent = self.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
+            for line in bounded_lines(BufReader::new(stdout), "axel claude-acp") {
                 let Ok(line) = line else { break };
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
                 match msg.get("type").and_then(Value::as_str) {
@@ -453,6 +395,7 @@ impl Agent {
                         let resp = msg.get("response").cloned().unwrap_or(Value::Null);
                         let id = resp.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
                         if let Some(waiter) = session.controls.lock().expect("controls lock").remove(&id) {
+                            // The requester timed out meanwhile: nobody to tell.
                             let _ = waiter.send(resp);
                         }
                     }
@@ -518,34 +461,15 @@ impl Agent {
         }
 
         if tool == "ExitPlanMode" {
-            let outcome = self.ask(
-                session,
-                &tool_call,
-                json!([
-                    { "kind": "allow_always", "name": "Yes, and auto-accept edits", "optionId": "acceptEdits" },
-                    { "kind": "allow_once", "name": "Yes, and manually approve edits", "optionId": "default" },
-                    { "kind": "reject_once", "name": "No, keep planning", "optionId": "plan" }
-                ]),
-            )?;
-            if outcome.is_none() {
-                return Err("Tool use aborted".into());
-            }
-            return Ok(match outcome.as_deref() {
-                Some(mode @ ("default" | "acceptEdits")) => {
-                    session.set_mode(mode);
-                    self.client.update(&session.id, json!({ "sessionUpdate": "current_mode_update", "currentModeId": mode }));
-                    json!({
-                        "behavior": "allow",
-                        "updatedInput": input,
-                        "updatedPermissions": suggestions.unwrap_or_else(|| json!([{ "type": "setMode", "mode": mode, "destination": "session" }])),
-                    })
-                }
-                _ => json!({ "behavior": "deny", "message": "User rejected request to exit plan mode.", "interrupt": true }),
-            });
+            return self.exit_plan_mode(session, &tool_call, input, suggestions);
         }
 
-        let mode = session.mode();
-        if mode == "bypassPermissions" || (mode == "acceptEdits" && is_edit_tool(tool)) {
+        let allowed_by_mode = match session.mode() {
+            PermissionMode::BypassPermissions => true,
+            PermissionMode::AcceptEdits => is_edit_tool(tool),
+            PermissionMode::Default | PermissionMode::Plan | PermissionMode::DontAsk => false,
+        };
+        if allowed_by_mode {
             return Ok(json!({
                 "behavior": "allow",
                 "updatedInput": input,
@@ -557,9 +481,9 @@ impl Agent {
             session,
             &tool_call,
             json!([
-                { "kind": "allow_always", "name": "Always Allow", "optionId": "allow_always" },
-                { "kind": "allow_once", "name": "Allow", "optionId": "allow" },
-                { "kind": "reject_once", "name": "Reject", "optionId": "reject" }
+                { "kind": "allow_always", "name": t!("Always Allow"), "optionId": "allow_always" },
+                { "kind": "allow_once", "name": t!("Allow"), "optionId": "allow" },
+                { "kind": "reject_once", "name": t!("Reject"), "optionId": "reject" }
             ]),
         )?;
         if outcome.is_none() {
@@ -569,6 +493,33 @@ impl Agent {
             Some("allow_always") => json!({ "behavior": "allow", "updatedInput": input, "updatedPermissions": suggestions.unwrap_or_else(|| always_rule(tool)) }),
             Some("allow") => json!({ "behavior": "allow", "updatedInput": input }),
             _ => json!({ "behavior": "deny", "message": "User refused permission to run tool", "interrupt": true }),
+        })
+    }
+
+    /// ExitPlanMode: ask how to go on, and switch to the mode picked
+    /// (accepting edits or not), or keep planning.
+    fn exit_plan_mode(&self, session: &Session, tool_call: &Value, input: Value, suggestions: Option<Value>) -> Result<Value, String> {
+        let outcome = self.ask(
+            session,
+            tool_call,
+            json!([
+                { "kind": "allow_always", "name": t!("Yes, and auto-accept edits"), "optionId": PermissionMode::AcceptEdits.as_str() },
+                { "kind": "allow_once", "name": t!("Yes, and manually approve edits"), "optionId": PermissionMode::Default.as_str() },
+                { "kind": "reject_once", "name": t!("No, keep planning"), "optionId": PermissionMode::Plan.as_str() }
+            ]),
+        )?;
+        let Some(picked) = outcome else { return Err("Tool use aborted".into()) };
+        Ok(match PermissionMode::parse(&picked) {
+            Some(mode @ (PermissionMode::Default | PermissionMode::AcceptEdits)) => {
+                session.set_mode(mode);
+                self.client.update(&session.id, json!({ "sessionUpdate": "current_mode_update", "currentModeId": mode.as_str() }));
+                json!({
+                    "behavior": "allow",
+                    "updatedInput": input,
+                    "updatedPermissions": suggestions.unwrap_or_else(|| json!([{ "type": "setMode", "mode": mode.as_str(), "destination": "session" }])),
+                })
+            }
+            _ => json!({ "behavior": "deny", "message": "User rejected request to exit plan mode.", "interrupt": true }),
         })
     }
 
@@ -622,10 +573,10 @@ impl Agent {
             .enumerate()
             .map(|(i, (_, label))| json!({ "kind": "allow_once", "name": label, "optionId": format!("{ANSWER_PREFIX}{i}") }))
             .collect();
-        options.push(json!({ "kind": "reject_once", "name": "Decline", "optionId": format!("{ANSWER_PREFIX}none") }));
+        options.push(json!({ "kind": "reject_once", "name": t!("Decline"), "optionId": format!("{ANSWER_PREFIX}none") }));
         let id = request.get("elicitation_id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| format!("elicitation-{}", chrono::Utc::now().timestamp_millis()));
         let server = request.get("mcp_server_name").and_then(Value::as_str).unwrap_or("");
-        let title = if message.is_empty() { format!("{server} asks") } else { message };
+        let title = if message.is_empty() { t!("{server} asks", server = server) } else { message };
         let tool_call = json!({ "toolCallId": id, "title": title, "kind": "think", "rawInput":{"multiSelect":multiple.is_some(),"minSelections":multiple.map(|b|b.0),"maxSelections":multiple.map(|b|b.1)} });
         match self.ask(session, &tool_call, Value::Array(options)) {
             Ok(Some(picked)) => match answer_indices(&picked,choices.len(),multiple.is_some()) {
@@ -661,8 +612,8 @@ impl Agent {
             && input.get("hook_event_name").and_then(Value::as_str) == Some("PostToolUse")
         {
             if input.get("tool_name").and_then(Value::as_str) == Some("EnterPlanMode") {
-                session.set_mode("plan");
-                self.client.update(&session.id, json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }));
+                session.set_mode(PermissionMode::Plan);
+                self.client.update(&session.id, json!({ "sessionUpdate": "current_mode_update", "currentModeId": PermissionMode::Plan.as_str() }));
             }
             if let Some(id) = request.get("tool_use_id").and_then(Value::as_str)
                 && session.hooked.lock().expect("hooked lock").remove(id)
@@ -707,7 +658,7 @@ impl Agent {
         let uuid = s.steering.lock().expect("steering lock").pending.iter().find(|(_, m)| *m == message_id).map(|(u, _)| u.clone());
         let Some(uuid) = uuid else { return false };
         let cancelled = s
-            .control(json!({ "subtype": "cancel_async_message", "message_uuid": uuid }), Duration::from_secs(10))
+            .control(json!({ "subtype": "cancel_async_message", "message_uuid": uuid }), WITHDRAW_TIMEOUT)
             .ok()
             .and_then(|r| r.get("cancelled").and_then(Value::as_bool))
             .unwrap_or(false);
@@ -750,6 +701,7 @@ impl Agent {
         // hasn't shown yet: relayed now, so a stale `result` can't end this
         // prompt before Claude has read it.
         while let Ok(message) = rx.try_recv() {
+            // Not this prompt's: a `result` among them ended Claude's own turn.
             let _ = self.relay_message(session, &message);
         }
         // Only now may messages be sent into the turn: one accepted before the
@@ -772,147 +724,145 @@ impl Agent {
     /// Relay one message from Claude to the client.  `Some` when it ends the
     /// turn (a `result`, or an error that does); the idle relay ignores that.
     fn relay_message(&self, session: &Arc<Session>, message: &Value) -> Option<RpcResult> {
-        let sid = session.id.clone();
         match message.get("type").and_then(Value::as_str).unwrap_or("") {
-                "system" | "tool_progress" | "tool_use_summary" | "auth_status" => {}
-                // How much of the plan's windows the account has used.
-                "rate_limit_event" => {
-                    let limits = claude_limits(message);
-                    if !limits.is_empty() {
-                        self.client.notify("_axel/limits", limits_params(&limits));
-                    }
+            "system" | "tool_progress" | "tool_use_summary" | "auth_status" => None,
+            // How much of the plan's windows the account has used.
+            "rate_limit_event" => {
+                let limits = claude_limits(message);
+                if !limits.is_empty() {
+                    self.client.notify("_axel/limits", limits_params(&limits));
                 }
-                "result" => {
-                    session.meter.lock().expect("meter lock").on_result(message);
-                    if session.cancelled.load(Ordering::SeqCst) {
-                        return Some(Ok(json!({ "stopReason": "cancelled" })));
-                    }
-                    // A message sent in after the turn's last step: Claude runs
-                    // it as a turn of its own. Its result ends this prompt.
-                    if !session.steering.lock().expect("steering lock").pending.is_empty() {
-                        return None;
-                    }
-                    let is_error = message.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                    let errors = || {
-                        let e: Vec<String> =
-                            message.get("errors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
-                        if e.is_empty() { message.get("subtype").and_then(Value::as_str).unwrap_or("").to_string() } else { e.join(", ") }
-                    };
-                    match message.get("subtype").and_then(Value::as_str).unwrap_or("") {
-                        "success" => {
-                            let result = message.get("result").and_then(Value::as_str).unwrap_or("");
-                            if result.contains("Please run /login") {
-                                return Some(Err(RpcError::auth_required()));
-                            }
-                            if is_error {
-                                return Some(Err(RpcError::internal(result)));
-                            }
-                            return Some(Ok(json!({ "stopReason": "end_turn" })));
-                        }
-                        "error_during_execution" => {
-                            if is_error {
-                                return Some(Err(RpcError::internal(errors())));
-                            }
-                            return Some(Ok(json!({ "stopReason": "end_turn" })));
-                        }
-                        "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" => {
-                            if is_error {
-                                return Some(Err(RpcError::internal(errors())));
-                            }
-                            return Some(Ok(json!({ "stopReason": "max_turn_requests" })));
-                        }
-                        other => eprintln!("[axel claude-acp] unexpected result subtype {other}"),
-                    }
-                }
-                "stream_event" => {
-                    let event = message.get("event").cloned().unwrap_or(Value::Null);
-                    let block = match event.get("type").and_then(Value::as_str) {
-                        Some("content_block_start") => event.get("content_block").cloned(),
-                        Some("content_block_delta") => event.get("delta").cloned(),
-                        _ => None,
-                    };
-                    if let Some(block) = block {
-                        let mut cache = session.tool_uses.lock().expect("tool uses lock");
-                        for u in to_acp(&Value::Array(vec![block]), "assistant", &mut cache, Some(&session.hooked)) {
-                            self.client.update(&sid, u);
-                        }
-                    }
-                }
-                // Claude's echo of a user message it took in: a steer that
-                // landed, or the prompt itself. Neither is relayed.
-                "user" if message.get("isReplay").and_then(Value::as_bool) == Some(true) => {
-                    let uuid = message.get("uuid").and_then(Value::as_str).unwrap_or("");
-                    let landed = session.steering.lock().expect("steering lock").pending.remove(uuid);
-                    if let Some(message_id) = landed {
-                        self.client.notify("_axel/steered", json!({ "sessionId": sid, "messageId": message_id }));
-                    }
-                }
-                kind @ ("user" | "assistant") => {
-                    if kind == "assistant" {
-                        let mut meter = session.meter.lock().expect("meter lock");
-                        meter.on_assistant(message);
-                        // A long turn's spend shows as it happens, not at its end.
-                        if let Some(p) = meter.progress(std::time::Instant::now()) {
-                            self.client.notify("_axel/usage", p.into_reply(json!({ "sessionId": sid })));
-                        }
-                    }
-                    if session.cancelled.load(Ordering::SeqCst) {
-                        return None;
-                    }
-                    let msg = message.get("message").cloned().unwrap_or(Value::Null);
-                    let content = msg.get("content").cloned().unwrap_or(Value::Null);
-                    if let Value::String(text) = &content {
-                        if text.contains("<local-command-stdout>") {
-                            if text.contains("Context Usage") {
-                                let clean = text.replace("<local-command-stdout>", "").replace("</local-command-stdout>", "");
-                                let mut cache = session.tool_uses.lock().expect("tool uses lock");
-                                for u in to_acp(&Value::String(clean), "assistant", &mut cache, Some(&session.hooked)) {
-                                    self.client.update(&sid, u);
-                                }
-                            }
-                            return None;
-                        }
-                        if text.contains("<local-command-stderr>") {
-                            eprintln!("{text}");
-                            return None;
-                        }
-                    }
-                    let single_text = content.as_array().is_some_and(|a| a.len() == 1 && a[0].get("type").and_then(Value::as_str) == Some("text"));
-                    if kind == "user" && (content.is_string() || single_text) {
-                        return None;
-                    }
-                    if kind == "assistant"
-                        && msg.get("model").and_then(Value::as_str) == Some("<synthetic>")
-                        && single_text
-                        && content[0].get("text").and_then(Value::as_str).is_some_and(|t| t.contains("Please run /login"))
-                    {
-                        return Some(Err(RpcError::auth_required()));
-                    }
-                    // Assistant text and thinking already streamed as deltas.
-                    let content = if kind == "assistant" {
-                        Value::Array(
-                            content
-                                .as_array()
-                                .map(|a| {
-                                    a.iter()
-                                        .filter(|c| !matches!(c.get("type").and_then(Value::as_str), Some("text" | "thinking")))
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        content
-                    };
-                    let role = msg.get("role").and_then(Value::as_str).unwrap_or(kind).to_string();
-                    let mut cache = session.tool_uses.lock().expect("tool uses lock");
-                    for u in to_acp(&content, &role, &mut cache, Some(&session.hooked)) {
-                        self.client.update(&sid, u);
-                    }
-                }
-                other => eprintln!("[axel claude-acp] unexpected message type {other}"),
+                None
             }
+            "result" => self.on_result(session, message),
+            "stream_event" => {
+                self.relay_stream_event(session, message);
+                None
+            }
+            // Claude's echo of a user message it took in: a steer that
+            // landed, or the prompt itself. Neither is relayed.
+            "user" if message.get("isReplay").and_then(Value::as_bool) == Some(true) => {
+                let uuid = message.get("uuid").and_then(Value::as_str).unwrap_or("");
+                let landed = session.steering.lock().expect("steering lock").pending.remove(uuid);
+                if let Some(message_id) = landed {
+                    self.client.notify("_axel/steered", json!({ "sessionId": session.id, "messageId": message_id }));
+                }
+                None
+            }
+            kind @ ("user" | "assistant") => self.relay_conversation(session, message, kind),
+            other => {
+                eprintln!("[axel claude-acp] unexpected message type {other}");
+                None
+            }
+        }
+    }
+
+    /// A `result`: the turn's spend, and how the prompt ends, unless a
+    /// message steered in too late runs on as a turn of its own.
+    fn on_result(&self, session: &Session, message: &Value) -> Option<RpcResult> {
+        session.meter.lock().expect("meter lock").on_result(message);
+        if session.cancelled.load(Ordering::SeqCst) {
+            return Some(Ok(json!({ "stopReason": "cancelled" })));
+        }
+        // A message sent in after the turn's last step: Claude runs it as a
+        // turn of its own. Its result ends this prompt.
+        if !session.steering.lock().expect("steering lock").pending.is_empty() {
+            return None;
+        }
+        let ends = result_stop(message);
+        if ends.is_none() {
+            let subtype = message.get("subtype").and_then(Value::as_str).unwrap_or("");
+            eprintln!("[axel claude-acp] unexpected result subtype {subtype}");
+        }
+        ends
+    }
+
+    /// A streamed content block, or a delta of one.
+    fn relay_stream_event(&self, session: &Session, message: &Value) {
+        let event = message.get("event").cloned().unwrap_or(Value::Null);
+        let block = match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => event.get("content_block").cloned(),
+            Some("content_block_delta") => event.get("delta").cloned(),
+            _ => None,
+        };
+        if let Some(block) = block {
+            self.relay_content(session, &Value::Array(vec![block]), "assistant");
+        }
+    }
+
+    /// A whole user or assistant message: its tool calls and results (its
+    /// text and thinking already streamed), and the output of local
+    /// commands.  `Some` when it says Claude isn't logged in.
+    fn relay_conversation(&self, session: &Session, message: &Value, kind: &str) -> Option<RpcResult> {
+        let is_assistant = kind == "assistant";
+        if is_assistant {
+            let mut meter = session.meter.lock().expect("meter lock");
+            meter.on_assistant(message);
+            // A long turn's spend shows as it happens, not at its end.
+            if let Some(p) = meter.progress(std::time::Instant::now()) {
+                self.client.notify("_axel/usage", p.into_reply(json!({ "sessionId": session.id })));
+            }
+        }
+        if session.cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let msg = message.get("message").cloned().unwrap_or(Value::Null);
+        let content = msg.get("content").cloned().unwrap_or(Value::Null);
+        if let Value::String(text) = &content
+            && self.relay_local_command(session, text)
+        {
+            return None;
+        }
+        let single_text = content.as_array().is_some_and(|a| a.len() == 1 && a[0].get("type").and_then(Value::as_str) == Some("text"));
+        if !is_assistant && (content.is_string() || single_text) {
+            return None;
+        }
+        if is_assistant
+            && msg.get("model").and_then(Value::as_str) == Some("<synthetic>")
+            && single_text
+            && content[0].get("text").and_then(Value::as_str).is_some_and(|t| t.contains("Please run /login"))
+        {
+            return Some(Err(RpcError::auth_required()));
+        }
+        // Assistant text and thinking already streamed as deltas.
+        let content = if is_assistant {
+            Value::Array(
+                content
+                    .as_array()
+                    .map(|a| a.iter().filter(|c| !matches!(c.get("type").and_then(Value::as_str), Some("text" | "thinking"))).cloned().collect())
+                    .unwrap_or_default(),
+            )
+        } else {
+            content
+        };
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or(kind).to_string();
+        self.relay_content(session, &content, &role);
         None
+    }
+
+    /// The output of a local command (`/context`): its context usage is
+    /// shown, the rest isn't.  Whether `text` was one.
+    fn relay_local_command(&self, session: &Session, text: &str) -> bool {
+        if text.contains("<local-command-stdout>") {
+            if text.contains("Context Usage") {
+                let clean = text.replace("<local-command-stdout>", "").replace("</local-command-stdout>", "");
+                self.relay_content(session, &Value::String(clean), "assistant");
+            }
+            return true;
+        }
+        if text.contains("<local-command-stderr>") {
+            eprintln!("{text}");
+            return true;
+        }
+        false
+    }
+
+    /// Claude content as session updates to the client.
+    fn relay_content(&self, session: &Session, content: &Value, role: &str) {
+        let mut cache = session.tool_uses.lock().expect("tool uses lock");
+        for u in to_acp(content, role, &mut cache, Some(&session.hooked)) {
+            self.client.update(&session.id, u);
+        }
     }
 
     /// Between prompts, Claude can go on by itself: a background task it
@@ -934,6 +884,7 @@ impl Agent {
                     loop {
                         match rx.try_recv() {
                             Ok(message) => {
+                                // No prompt is running for a `result` to end.
                                 let _ = agent.relay_message(&session, &message);
                             }
                             Err(mpsc::TryRecvError::Empty) => break,
@@ -941,13 +892,188 @@ impl Agent {
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(IDLE_RELAY_POLL);
             }
         });
     }
 }
 
-fn is_edit_tool(tool: &str) -> bool {
+/// MCP servers for Claude's `--mcp-config`: any from
+/// `_meta.claudeCode.options.mcpServers`, then the client's.
+fn mcp_servers(params: &Value, user_options: &Value) -> Map<String, Value> {
+    let mut mcp = user_options.get("mcpServers").and_then(Value::as_object).cloned().unwrap_or_default();
+    for server in params.get("mcpServers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = server.get("name").and_then(Value::as_str) else { continue };
+        let pairs = |k: &str| -> Option<Value> {
+            let a = server.get(k)?.as_array()?;
+            Some(Value::Object(
+                a.iter()
+                    .filter_map(|e| Some((e.get("name")?.as_str()?.to_string(), e.get("value").cloned().unwrap_or(Value::Null))))
+                    .collect(),
+            ))
+        };
+        let entry = match server.get("type").and_then(Value::as_str) {
+            Some(kind) => json!({ "type": kind, "url": server.get("url"), "headers": pairs("headers") }),
+            None => json!({ "type": "stdio", "command": server.get("command"), "args": server.get("args"), "env": pairs("env") }),
+        };
+        mcp.insert(name.to_string(), strip_nulls(entry));
+    }
+    mcp
+}
+
+/// Claude Code's command line for a session, as the Agent SDK builds it.
+fn claude_args(params: &Value, user_options: &Value, mcp: &Map<String, Value>, resume: Option<&str>, session_id: &str) -> Vec<String> {
+    // `--replay-user-messages`: Claude echoes each user message as it takes
+    // it in, which is how a steer is known to have landed.
+    let mut args: Vec<String> =
+        ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--replay-user-messages"].map(String::from).to_vec();
+    if let Some(n) = std::env::var("MAX_THINKING_TOKENS").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
+        args.extend(["--max-thinking-tokens".into(), n.to_string()]);
+    }
+    args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
+    // The agent's reasoning effort, from the host (`_meta.axel.effort`).
+    if let Some(effort) = crate::host::meta_effort(params).and_then(|e| axel_store::Harness::Claude.native_effort(e)) {
+        args.extend(["--effort".into(), effort.into()]);
+    }
+    if let Some(r) = resume {
+        args.extend(["--resume".into(), r.to_string()]);
+    }
+    // AskUserQuestion stays on: each question is asked as a permission
+    // request whose options are the choices (see `ask_questions`).
+    args.extend(["--tools".into(), "default".into()]);
+    if !mcp.is_empty() {
+        args.extend(["--mcp-config".into(), json!({ "mcpServers": mcp }).to_string()]);
+    }
+    args.extend(["--setting-sources".into(), "user,project,local".into()]);
+    args.extend(["--permission-mode".into(), PermissionMode::Default.as_str().into()]);
+    if allow_bypass() {
+        args.push("--allow-dangerously-skip-permissions".into());
+    }
+    args.push("--include-partial-messages".into());
+    if resume.is_none() {
+        args.extend(["--session-id".into(), session_id.to_string()]);
+    }
+    for (k, v) in user_options.get("extraArgs").and_then(Value::as_object).into_iter().flatten() {
+        args.push(format!("--{k}"));
+        match v {
+            Value::Null => {}
+            Value::String(s) => args.push(s.clone()),
+            other => args.push(other.to_string()),
+        }
+    }
+    args
+}
+
+/// The command that runs Claude Code `exe` (a script runs under node), with
+/// the environment the Agent SDK gives it.
+fn claude_command(exe: &str) -> Command {
+    let mut cmd = if [".js", ".mjs", ".cjs"].iter().any(|ext| exe.ends_with(ext)) {
+        let mut c = Command::new("node");
+        c.arg(exe);
+        c
+    } else {
+        Command::new(exe)
+    };
+    if std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_none() {
+        cmd.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
+    }
+    cmd.env_remove("NODE_OPTIONS");
+    if std::env::var_os("DEBUG_CLAUDE_AGENT_SDK").is_some() {
+        cmd.env("DEBUG", "1");
+    } else {
+        cmd.env_remove("DEBUG");
+    }
+    cmd
+}
+
+/// The `initialize` control request: our hook, and the system prompt
+/// (Claude Code's own, plus an appended part, or a replacement).
+fn initialize_request(meta: &Value) -> Value {
+    let mut init = json!({
+        "subtype": "initialize",
+        "hooks": { "PostToolUse": [{ "hookCallbackIds": [POST_TOOL_USE_HOOK] }] }
+    });
+    match meta.get("systemPrompt") {
+        Some(Value::String(replacement)) => init["systemPrompt"] = Value::String(replacement.clone()),
+        Some(v) => {
+            if let Some(append) = v.get("append").and_then(Value::as_str) {
+                init["appendSystemPrompt"] = Value::String(append.to_string());
+            }
+        }
+        None => {}
+    }
+    init
+}
+
+/// Put Claude on the settings' `model` when it names one Claude offers,
+/// else the first it offers; the ACP `models` for the session reply.
+fn select_model(session: &Session, init: &Value, cwd: &Path) -> Value {
+    let models = init.get("models").and_then(Value::as_array).cloned().unwrap_or_default();
+    let wanted = settings_model(cwd);
+    let current = wanted
+        .as_deref()
+        .and_then(|want| models.iter().find(|m| model_matches(m, want)))
+        .or_else(|| models.first())
+        .cloned();
+    if let Some(value) = current.as_ref().and_then(|m| m.get("value")).and_then(Value::as_str)
+        && let Err(e) = session.control(json!({ "subtype": "set_model", "model": value }), CONTROL_TIMEOUT)
+    {
+        // Claude keeps its own default; the session still works.
+        eprintln!("[axel claude-acp] set_model {value}: {e}");
+    }
+    json!({
+        "availableModels": models.iter().map(|m| json!({ "modelId": m.get("value"), "name": m.get("displayName"), "description": m.get("description") })).collect::<Vec<_>>(),
+        "currentModelId": current.as_ref().and_then(|m| m.get("value")),
+    })
+}
+
+/// The ACP session modes: Claude Code's permission modes, bypass only where
+/// it works (see [`allow_bypass`]).
+fn available_modes() -> Vec<Value> {
+    let mut modes = vec![
+        json!({ "id": PermissionMode::Default.as_str(), "name": "Default", "description": "Standard behavior, prompts for dangerous operations" }),
+        json!({ "id": PermissionMode::AcceptEdits.as_str(), "name": "Accept Edits", "description": "Auto-accept file edit operations" }),
+        json!({ "id": PermissionMode::Plan.as_str(), "name": "Plan Mode", "description": "Planning mode, no actual tool execution" }),
+        json!({ "id": PermissionMode::DontAsk.as_str(), "name": "Don't Ask", "description": "Don't prompt for permissions, deny if not pre-approved" }),
+    ];
+    if allow_bypass() {
+        modes.push(json!({ "id": PermissionMode::BypassPermissions.as_str(), "name": "Bypass Permissions", "description": "Bypass all permission checks" }));
+    }
+    modes
+}
+
+/// How a `result` ends the prompt: its stop reason, or the error it
+/// reports.  `None` for a subtype this adapter doesn't know.
+fn result_stop(message: &Value) -> Option<RpcResult> {
+    let is_error = message.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    let subtype = message.get("subtype").and_then(Value::as_str).unwrap_or("");
+    let errors = || {
+        let e: Vec<String> =
+            message.get("errors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        if e.is_empty() { subtype.to_string() } else { e.join(", ") }
+    };
+    Some(match subtype {
+        "success" => {
+            let result = message.get("result").and_then(Value::as_str).unwrap_or("");
+            if result.contains("Please run /login") {
+                Err(RpcError::auth_required())
+            } else if is_error {
+                Err(RpcError::internal(result))
+            } else {
+                Ok(json!({ "stopReason": "end_turn" }))
+            }
+        }
+        "error_during_execution" if is_error => Err(RpcError::internal(errors())),
+        "error_during_execution" => Ok(json!({ "stopReason": "end_turn" })),
+        "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" if is_error => Err(RpcError::internal(errors())),
+        "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" => Ok(json!({ "stopReason": "max_turn_requests" })),
+        _ => return None,
+    })
+}
+
+fn is_edit_tool(
+
+tool: &str) -> bool {
     // The adapter's EDIT_TOOL_NAMES are its `mcp__acp__Edit` / `Write`; with
     // native tools those are Claude Code's Edit and Write (and NotebookEdit,
     // which Claude Code's own accept-edits mode covers too).
@@ -985,14 +1111,16 @@ fn elicitation_choice(schema: &Value) -> Option<ElicitationChoice> {
             })
             .collect()
     } else if p.get("type").and_then(Value::as_str) == Some("boolean") {
-        vec![(Value::Bool(true), "Yes".into()), (Value::Bool(false), "No".into())]
+        vec![(Value::Bool(true), t!("Yes").into()), (Value::Bool(false), t!("No").into())]
     } else {
         return None;
     };
     if choices.is_empty() {return None}
     let multiple=if multi {
-        let min=property.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let max=property.get("maxItems").and_then(Value::as_u64).map(|n|n as usize).unwrap_or(choices.len()).min(choices.len());
+        // Saturating: an absurd bound is refused below rather than wrapped.
+        let count = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        let min=property.get("minItems").and_then(Value::as_u64).map_or(0, count);
+        let max=property.get("maxItems").and_then(Value::as_u64).map_or(choices.len(), count).min(choices.len());
         if min>max {return None}
         Some((min,max))
     } else {None};
@@ -1030,7 +1158,7 @@ fn question_request(tool_use_id: &Value, qi: usize, q: &Value) -> (Value, Value,
         Some(h) => format!("{h}: {text}"),
         None => text.to_string(),
     };
-    if multi { title.push_str(" (select all that apply)"); }
+    if multi { title = t!("{question} (select all that apply)", question = title); }
     let mut labels = Vec::new();
     let mut options: Vec<Value> = Vec::new();
     for (i, o) in q.get("options").and_then(Value::as_array).into_iter().flatten().enumerate() {
@@ -1042,7 +1170,7 @@ fn question_request(tool_use_id: &Value, qi: usize, q: &Value) -> (Value, Value,
         options.push(json!({ "kind": "allow_once", "name": name, "optionId": format!("{ANSWER_PREFIX}{i}") }));
         labels.push(label);
     }
-    options.push(json!({ "kind": "reject_once", "name": "None of these (I'll answer in the chat)", "optionId": format!("{ANSWER_PREFIX}none") }));
+    options.push(json!({ "kind": "reject_once", "name": t!("None of these (I'll answer in the chat)"), "optionId": format!("{ANSWER_PREFIX}none") }));
     let id = format!("{}#{qi}", tool_use_id.as_str().unwrap_or("question"));
     let tool_call = json!({ "toolCallId": id, "title": title, "kind": "think", "rawInput": q });
     (tool_call, Value::Array(options), labels)
@@ -1053,7 +1181,42 @@ fn always_rule(tool: &str) -> Value {
 }
 
 /// ACP session/update payloads for Claude content blocks: `toAcpNotifications`.
-fn to_acp(content: &Value, role: &str, cache: &mut HashMap<String, Value>, hooks: Option<&Mutex<HashSet<String>>>) -> Vec<Value> {
+/// The tool uses most recently seen, to name their results.  A result
+/// follows its call within the turn, and a turn rarely makes more than a
+/// few hundred calls: past this many, the oldest are forgotten (a result
+/// that late shows as untracked) rather than kept for the whole session.
+const TOOL_USES_MAX: usize = 1024;
+
+/// `tool_use` blocks by id, the newest [`TOOL_USES_MAX`].
+#[derive(Default)]
+struct ToolUses {
+    by_id: HashMap<String, Value>,
+    /// Ids, oldest first.
+    order: std::collections::VecDeque<String>,
+}
+
+impl ToolUses {
+    /// Remember a tool use; returns the id forgotten to make room, if any.
+    fn insert(&mut self, id: String, tool_use: Value) -> Option<String> {
+        if self.by_id.insert(id.clone(), tool_use).is_some() {
+            return None;
+        }
+        self.order.push_back(id);
+        let forgotten = if self.order.len() > TOOL_USES_MAX { self.order.pop_front() } else { None };
+        if let Some(old) = &forgotten {
+            self.by_id.remove(old);
+        }
+        debug_assert_eq!(self.by_id.len(), self.order.len());
+        assert!(self.by_id.len() <= TOOL_USES_MAX);
+        forgotten
+    }
+
+    fn get(&self, id: &str) -> Option<&Value> {
+        self.by_id.get(id)
+    }
+}
+
+fn to_acp(content: &Value, role: &str, cache: &mut ToolUses, hooks: Option<&Mutex<HashSet<String>>>) -> Vec<Value> {
     let chunk_kind = if role == "assistant" { "agent_message_chunk" } else { "user_message_chunk" };
     if let Value::String(text) = content {
         return vec![json!({ "sessionUpdate": chunk_kind, "content": { "type": "text", "text": text } })];
@@ -1063,44 +1226,9 @@ fn to_acp(content: &Value, role: &str, cache: &mut HashMap<String, Value>, hooks
         let kind = chunk.get("type").and_then(Value::as_str).unwrap_or("");
         let update = match kind {
             "text" | "text_delta" => Some(json!({ "sessionUpdate": chunk_kind, "content": { "type": "text", "text": chunk.get("text") } })),
-            "image" => {
-                let src = chunk.get("source").cloned().unwrap_or(Value::Null);
-                let b64 = src.get("type").and_then(Value::as_str) == Some("base64");
-                let mut c = json!({
-                    "type": "image",
-                    "data": if b64 { src.get("data").cloned().unwrap_or(Value::Null) } else { json!("") },
-                    "mimeType": if b64 { src.get("media_type").cloned().unwrap_or(Value::Null) } else { json!("") },
-                });
-                if src.get("type").and_then(Value::as_str) == Some("url") {
-                    c["uri"] = src.get("url").cloned().unwrap_or(Value::Null);
-                }
-                Some(json!({ "sessionUpdate": chunk_kind, "content": c }))
-            }
+            "image" => Some(json!({ "sessionUpdate": chunk_kind, "content": image_content(chunk) })),
             "thinking" | "thinking_delta" => Some(json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": chunk.get("thinking") } })),
-            "tool_use" | "server_tool_use" | "mcp_tool_use" => {
-                let id = chunk.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                cache.insert(id.clone(), chunk.clone());
-                let name = chunk.get("name").and_then(Value::as_str).unwrap_or("");
-                let input = chunk.get("input").cloned().unwrap_or(json!({}));
-                if name == "TodoWrite" {
-                    input.get("todos").filter(|t| t.is_array()).map(|_| json!({ "sessionUpdate": "plan", "entries": tools::plan_entries(&input) }))
-                } else {
-                    if let Some(h) = hooks {
-                        h.lock().expect("hooked lock").insert(id.clone());
-                    }
-                    let mut u = json!({
-                        "_meta": { "claudeCode": { "toolName": name } },
-                        "toolCallId": id,
-                        "sessionUpdate": "tool_call",
-                        "rawInput": input,
-                        "status": "pending",
-                    });
-                    for (k, v) in tools::tool_info(name, &input) {
-                        u[k] = v;
-                    }
-                    Some(u)
-                }
-            }
+            "tool_use" | "server_tool_use" | "mcp_tool_use" => tool_use_update(chunk, cache, hooks),
             "tool_result"
             | "tool_search_tool_result"
             | "web_fetch_tool_result"
@@ -1108,32 +1236,7 @@ fn to_acp(content: &Value, role: &str, cache: &mut HashMap<String, Value>, hooks
             | "code_execution_tool_result"
             | "bash_code_execution_tool_result"
             | "text_editor_code_execution_tool_result"
-            | "mcp_tool_result" => {
-                let id = chunk.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                match cache.get(id) {
-                    None => {
-                        eprintln!("[axel claude-acp] tool result for an untracked tool use: {id}");
-                        None
-                    }
-                    Some(tool_use) => {
-                        let name = tool_use.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                        (name != "TodoWrite").then(|| {
-                            let failed = chunk.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                            let mut u = json!({
-                                "_meta": { "claudeCode": { "toolName": name } },
-                                "toolCallId": id,
-                                "sessionUpdate": "tool_call_update",
-                                "status": if failed { "failed" } else { "completed" },
-                                "rawOutput": chunk.get("content"),
-                            });
-                            for (k, v) in tools::tool_update(chunk, &name) {
-                                u[k] = v;
-                            }
-                            u
-                        })
-                    }
-                }
-            }
+            | "mcp_tool_result" => tool_result_update(chunk, cache),
             _ => None,
         };
         out.extend(update);
@@ -1141,8 +1244,80 @@ fn to_acp(content: &Value, role: &str, cache: &mut HashMap<String, Value>, hooks
     out
 }
 
-/// A Claude user message for an ACP prompt: `promptToClaude`.
-/// A random (v4) UUID, the id Claude takes for a user message.
+/// An image block as ACP image content.
+fn image_content(chunk: &Value) -> Value {
+    let src = chunk.get("source").cloned().unwrap_or(Value::Null);
+    let b64 = src.get("type").and_then(Value::as_str) == Some("base64");
+    let mut c = json!({
+        "type": "image",
+        "data": if b64 { src.get("data").cloned().unwrap_or(Value::Null) } else { json!("") },
+        "mimeType": if b64 { src.get("media_type").cloned().unwrap_or(Value::Null) } else { json!("") },
+    });
+    if src.get("type").and_then(Value::as_str) == Some("url") {
+        c["uri"] = src.get("url").cloned().unwrap_or(Value::Null);
+    }
+    c
+}
+
+/// A `tool_use` block: a plan for TodoWrite, else a tool call (remembered,
+/// to name its result, and registered for its PostToolUse hook).
+fn tool_use_update(chunk: &Value, cache: &mut ToolUses, hooks: Option<&Mutex<HashSet<String>>>) -> Option<Value> {
+    let id = chunk.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    // A forgotten call can't be named any more: its hook can go too.
+    if let Some(forgotten) = cache.insert(id.clone(), chunk.clone())
+        && let Some(h) = hooks
+    {
+        h.lock().expect("hooked lock").remove(&forgotten);
+    }
+    let name = chunk.get("name").and_then(Value::as_str).unwrap_or("");
+    let input = chunk.get("input").cloned().unwrap_or(json!({}));
+    if name == "TodoWrite" {
+        return input.get("todos").filter(|t| t.is_array()).map(|_| json!({ "sessionUpdate": "plan", "entries": tools::plan_entries(&input) }));
+    }
+    if let Some(h) = hooks {
+        h.lock().expect("hooked lock").insert(id.clone());
+    }
+    let mut u = json!({
+        "_meta": { "claudeCode": { "toolName": name } },
+        "toolCallId": id,
+        "sessionUpdate": "tool_call",
+        "rawInput": input,
+        "status": "pending",
+    });
+    for (k, v) in tools::tool_info(name, &input) {
+        u[k] = v;
+    }
+    Some(u)
+}
+
+/// A tool result block: an update to the call it answers (none for
+/// TodoWrite, whose plan is its own update, or a call never seen).
+fn tool_result_update(chunk: &Value, cache: &ToolUses) -> Option<Value> {
+    let id = chunk.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+    let Some(tool_use) = cache.get(id) else {
+        eprintln!("[axel claude-acp] tool result for an untracked tool use: {id}");
+        return None;
+    };
+    let name = tool_use.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    if name == "TodoWrite" {
+        return None;
+    }
+    let failed = chunk.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    let mut u = json!({
+        "_meta": { "claudeCode": { "toolName": name } },
+        "toolCallId": id,
+        "sessionUpdate": "tool_call_update",
+        "status": if failed { "failed" } else { "completed" },
+        "rawOutput": chunk.get("content"),
+    });
+    for (k, v) in tools::tool_update(chunk, &name) {
+        u[k] = v;
+    }
+    Some(u)
+}
+
+/// A random (version 4) UUID: the id of a new Claude session, or of a user
+/// message sent into a turn.
 fn new_uuid() -> String {
     use std::io::Read;
     let mut b = [0u8; 16];
@@ -1150,15 +1325,19 @@ fn new_uuid() -> String {
         // No randomness to be had: a clock and a counter are unique enough here.
         static N: AtomicU64 = AtomicU64::new(0);
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        b[..8].copy_from_slice(&(t as u64).to_le_bytes());
+        // The clock's low 64 bits: they are the ones that change.
+        b[..8].copy_from_slice(&t.to_le_bytes()[..8]);
         b[8..].copy_from_slice(&N.fetch_add(1, Ordering::SeqCst).to_le_bytes());
     }
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    let uuid = format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]);
+    debug_assert_eq!(uuid.len(), 36, "the canonical 8-4-4-4-12 form");
+    uuid
 }
 
+/// A Claude user message for an ACP prompt: `promptToClaude`.
 fn prompt_to_claude(params: &Value) -> Value {
     let mut content = Vec::new();
     let mut context = Vec::new();
@@ -1306,8 +1485,8 @@ fn find_session_file(session_id: &str, cwd: &Path) -> Option<PathBuf> {
 /// Send a saved conversation to the client: `replaySessionHistory`.
 fn replay(client: &Client, session_id: &str, file: &Path) {
     let Ok(f) = std::fs::File::open(file) else { return };
-    let mut cache = HashMap::new();
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
+    let mut cache = ToolUses::default();
+    for line in bounded_lines(BufReader::new(f), "axel claude-acp").map_while(Result::ok) {
         let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else { continue };
         let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
         if kind != "user" && kind != "assistant" {
@@ -1341,18 +1520,6 @@ fn strip_nulls(v: Value) -> Value {
     }
 }
 
-/// A random (version 4) UUID, for new Claude sessions.
-fn uuid_v4() -> String {
-    let mut b = [0u8; 16];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).is_err() {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        b = t.to_le_bytes();
-    }
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
-}
 
 #[cfg(test)]
 mod tests {
@@ -1437,7 +1604,7 @@ mod tests {
 
     #[test]
     fn blocks_become_acp_updates() {
-        let mut cache = HashMap::new();
+        let mut cache = ToolUses::default();
         let hooked = Mutex::new(HashSet::new());
         let blocks = json!([
             { "type": "text", "text": "hello" },
@@ -1487,7 +1654,7 @@ mod tests {
 
     #[test]
     fn session_ids_are_uuids() {
-        let id = uuid_v4();
+        let id = new_uuid();
         assert_eq!(id.len(), 36);
         assert_eq!(&id[14..15], "4");
     }

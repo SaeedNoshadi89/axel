@@ -30,6 +30,14 @@ pub const BUDGET: Duration = Duration::from_secs(10);
 /// Past this, a checkpoint is slow enough to tell the owner about.
 pub const SLOW: Duration = Duration::from_secs(2);
 
+/// The budget of a snapshot taken outside a turn ([`snapshot_commit`]):
+/// nothing waits on it the way a turn does, so it may take long on a huge
+/// tree, but it still never hangs.
+const SNAPSHOT_BUDGET: Duration = Duration::from_secs(600);
+
+/// How often [`git`] checks whether its child has exited.
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
 /// A snapshot of the working tree: its commit, and the tree it points at (two
 /// snapshots with one tree have the same content, whatever their parents).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +73,8 @@ pub fn ref_name(thread_id: &str, session_id: &str, ordinal: i64, which: Which) -
 /// `same_as`, a tree equal to that snapshot's is that snapshot (so a turn
 /// that changed nothing has `after == before`).
 pub fn capture(dir: &Path, ref_name: &str, budget: Duration, same_as: Option<&Snapshot>) -> Result<Option<Snapshot>> {
+    // Never anywhere else: `refs/heads` would make a branch the user sees.
+    assert!(ref_name.starts_with(REFS), "checkpoints live under {REFS}");
     let deadline = Instant::now() + budget;
     let Some(mut snap) = take(dir, deadline)? else { return Ok(None) };
     if let Some(prev) = same_as.filter(|p| p.tree == snap.tree) {
@@ -94,7 +104,7 @@ fn is_repo_with_head(dir: &Path, deadline: Instant) -> bool {
 /// files, not ignored ones), or HEAD itself when nothing changed.  The
 /// user's index and branches are untouched.
 pub fn snapshot_commit(dir: &Path, message: &str) -> Result<String> {
-    snapshot_commit_until(dir, message, Instant::now() + Duration::from_secs(600))
+    snapshot_commit_until(dir, message, Instant::now() + SNAPSHOT_BUDGET)
 }
 
 fn snapshot_commit_until(dir: &Path, message: &str, deadline: Instant) -> Result<String> {
@@ -111,6 +121,8 @@ fn snapshot_commit_until(dir: &Path, message: &str, deadline: Instant) -> Result
         // Never signed: a snapshot must not wait on a signing agent's prompt.
         git(dir, &["commit-tree", "--no-gpg-sign", &tree, "-p", &head, "-m", message], &env, deadline)
     })();
+    // Either file may not exist (git failed before writing it); a leftover
+    // in the temp directory is harmless, so the snapshot's own result wins.
     let _ = std::fs::remove_file(&index);
     let _ = std::fs::remove_file(index.with_extension("lock"));
     result
@@ -137,6 +149,7 @@ pub fn changes(dir: &Path, before: &Snapshot, after: &Snapshot, authored: &[Path
     out.truncated = files.len() > TurnChanges::MAX_FILES;
     files.truncate(TurnChanges::MAX_FILES);
     out.files = files;
+    assert!(out.files.len() <= TurnChanges::MAX_FILES, "the turn envelope carries at most MAX_FILES files");
     Ok(out)
 }
 
@@ -195,35 +208,51 @@ pub fn git(dir: &Path, args: &[&str], env: &[(&str, &OsStr)], deadline: Instant)
     }
     let mut child = cmd.spawn().context("running git")?;
     // Read both pipes on threads, so a chatty command can't block on a full pipe.
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let out = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = stdout.read_to_end(&mut v);
-        v
-    });
-    let err = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = stderr.read_to_end(&mut v);
-        v
-    });
+    let stdout = child.stdout.take().expect("stdout was set to piped above");
+    let stderr = child.stderr.take().expect("stderr was set to piped above");
+    let out = std::thread::spawn(move || read_capped(stdout));
+    let err = std::thread::spawn(move || read_capped(stderr));
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
         }
         if Instant::now() >= deadline {
+            // It may have exited just now; either way the budget is spent
+            // and the error below is what the caller needs to know.
             let _ = child.kill();
             let _ = child.wait();
             bail!("git {} took longer than its time budget", args.first().copied().unwrap_or(""));
         }
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(GIT_POLL_INTERVAL);
     };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    let (stdout, stdout_cut) = out.join().unwrap_or_default();
+    let (stderr, _) = err.join().unwrap_or_default();
     if !status.success() {
         bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&stderr).trim());
     }
+    // Cut output would be read as a wrong answer (a short file list), so it
+    // is an error; a cut error message is still the message.
+    if stdout_cut {
+        bail!("git {}: output over {GIT_OUTPUT_LIMIT_BYTES} bytes", args.first().copied().unwrap_or(""));
+    }
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// The most of a git command's stdout or stderr that is kept.  The largest
+/// output read here is a turn's `diff-tree --numstat`: a line per changed
+/// file, so 64 MiB is hundreds of thousands of files.
+const GIT_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read `pipe` to its end, keeping at most [`GIT_OUTPUT_LIMIT_BYTES`]; the
+/// rest is read and thrown away, so git never blocks on a full pipe.
+/// Returns what was kept, and whether anything was cut.
+fn read_capped(mut pipe: impl Read) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    // A read error ends the output early; git's exit status, checked by the
+    // caller, says whether the command worked.
+    let _ = (&mut pipe).take(GIT_OUTPUT_LIMIT_BYTES).read_to_end(&mut kept);
+    let rest_bytes = std::io::copy(&mut pipe, &mut std::io::sink()).unwrap_or(0);
+    (kept, rest_bytes > 0)
 }
 
 #[cfg(test)]

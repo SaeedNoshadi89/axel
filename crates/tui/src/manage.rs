@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use axel_i18n::t;
 use axel_store::AgentColor;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -17,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::theme;
-use crate::util::{ellipsize, format_tokens};
+use crate::util::{ellipsize, format_tokens, pad_end, pad_start, text_width};
 
 const POLL: Duration = Duration::from_millis(60);
 
@@ -103,15 +104,15 @@ impl Action {
 
     pub fn label(self) -> &'static str {
         match self {
-            Action::Reset => "Reset",
-            Action::Move => "Move",
-            Action::Settle => "Settle",
-            Action::Reopen => "Reopen",
-            Action::Archive => "Archive",
-            Action::Stop => "Stop all",
-            Action::StopAgent => "Agents",
-            Action::Rename => "Rename",
-            Action::HardReset => "Hard reset",
+            Action::Reset => t!("Reset"),
+            Action::Move => t!("Move"),
+            Action::Settle => t!("Settle"),
+            Action::Reopen => t!("Reopen"),
+            Action::Archive => t!("Archive"),
+            Action::Stop => t!("Stop all"),
+            Action::StopAgent => t!("Agents"),
+            Action::Rename => t!("Rename"),
+            Action::HardReset => t!("Hard reset"),
         }
     }
 
@@ -191,17 +192,18 @@ impl ManageView {
 
     /// One line on what a row does, for this thread.
     pub fn describe(&self, action: Action) -> String {
-        let agent = self.data.agents.first().cloned().unwrap_or_else(|| "the agent".into());
+        let agent = self.data.agents.first().cloned().unwrap_or_else(|| t!("the agent").into());
         match action {
-            Action::Reset => format!("a fresh context for {agent}: a new session with a recap of the thread, nothing else carried over"),
-            Action::Move => format!("run {agent} on another machine: {}", self.data.hosts.join(", ")),
-            Action::Settle => "mark it done; it stays listed, dimmed".into(),
-            Action::Reopen => "back to open".into(),
-            Action::Archive => "stop its sessions and hide it (axel thread reopen brings it back)".into(),
-            Action::StopAgent => "pause, resume, kill, or remove an agent from this thread".into(),
-            Action::Stop => format!("end {} live session{}", self.live_count(), if self.live_count() == 1 { "" } else { "s" }),
-            Action::Rename => "change the title (the window follows)".into(),
-            Action::HardReset => "end every session and relaunch the panes; no agent, no recap: the next message starts from scratch".into(),
+            Action::Reset => t!("a fresh context for {agent}: a new session with a recap of the thread, nothing else carried over", agent = agent),
+            Action::Move => t!("run {agent} on another machine: {hosts}", agent = agent, hosts = self.data.hosts.join(", ")),
+            Action::Settle => t!("mark it done; it stays listed, dimmed").into(),
+            Action::Reopen => t!("back to open").into(),
+            Action::Archive => t!("stop its sessions and hide it (axel thread reopen brings it back)").into(),
+            Action::StopAgent => t!("pause, resume, kill, or remove an agent from this thread").into(),
+            Action::Stop if self.live_count() == 1 => t!("end 1 live session").into(),
+            Action::Stop => t!("end {n} live sessions", n = self.live_count()),
+            Action::Rename => t!("change the title (the window follows)").into(),
+            Action::HardReset => t!("end every session and relaunch the panes; no agent, no recap: the next message starts from scratch").into(),
         }
     }
 
@@ -209,16 +211,14 @@ impl ManageView {
         self.data.sessions.iter().filter(|s| s.live).count()
     }
 
-    fn agents_for(&self, _action: Action) -> Vec<String> { self.data.agents.clone() }
-
     fn agent_actions(&self, agent: &str) -> Vec<(&'static str, char, Outcome)> {
         let mut actions = Vec::new();
         let live: Vec<_> = self.data.sessions.iter().filter(|s| s.agent == agent && s.live).collect();
         let name = || agent.to_string();
-        if live.iter().any(|s| s.state != "paused") { actions.push(("Pause", 'p', Outcome::PauseAgent { agent: name() })); }
-        if live.iter().any(|s| s.state == "paused") { actions.push(("Resume", 'r', Outcome::ResumeAgent { agent: name() })); }
-        if !live.is_empty() { actions.push(("Kill", 'x', Outcome::StopAgent { agent: name() })); }
-        actions.push(("Remove from thread", 'd', Outcome::RemoveAgent { agent: name() }));
+        if live.iter().any(|s| s.state != "paused") { actions.push((t!("Pause"), 'p', Outcome::PauseAgent { agent: name() })); }
+        if live.iter().any(|s| s.state == "paused") { actions.push((t!("Resume"), 'r', Outcome::ResumeAgent { agent: name() })); }
+        if !live.is_empty() { actions.push((t!("Kill"), 'x', Outcome::StopAgent { agent: name() })); }
+        actions.push((t!("Remove from thread"), 'd', Outcome::RemoveAgent { agent: name() }));
         actions
     }
 
@@ -231,81 +231,110 @@ impl ManageView {
             return Some(Outcome::Close);
         }
         match self.step.clone() {
-            Step::Menu => {
-                let actions = self.actions();
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => return Some(Outcome::Close),
-                    KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Char('j') => self.cursor = (self.cursor + 1).min(actions.len().saturating_sub(1)),
-                    KeyCode::Enter => {
-                        let action = actions.get(self.cursor).copied()?;
-                        self.start(action);
-                    }
-                    KeyCode::Char(c) => {
-                        // Each row has a key of its own, shown beside it.
-                        if let Some(a) = actions.iter().find(|a| a.key() == c.to_ascii_lowercase()) {
-                            self.start(*a);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            Step::Menu => self.menu_key(key.code),
             Step::PickAgent { action, idx } => {
-                let candidates = self.agents_for(action);
-                match key.code {
-                    KeyCode::Esc => self.step = Step::Menu,
-                    KeyCode::Up | KeyCode::Char('k') => self.step = Step::PickAgent { action, idx: idx.saturating_sub(1) },
-                    KeyCode::Down | KeyCode::Char('j') => self.step = Step::PickAgent { action, idx: (idx + 1).min(candidates.len().saturating_sub(1)) },
-                    KeyCode::Enter => {
-                        if let Some(agent) = candidates.get(idx) { self.after_agent(action, agent.clone()); }
-                    }
-                    _ => {}
-                }
-            },
-            Step::PickHost { agent, idx } => match key.code {
-                KeyCode::Esc => self.step = Step::Menu,
-                KeyCode::Up | KeyCode::Char('k') => self.step = Step::PickHost { agent, idx: idx.saturating_sub(1) },
-                KeyCode::Down | KeyCode::Char('j') => self.step = Step::PickHost { agent, idx: (idx + 1).min(self.data.hosts.len() - 1) },
-                KeyCode::Enter => self.step = Step::Confirm(Outcome::Move { agent, host: self.data.hosts[idx].clone() }),
-                _ => {}
-            },
+                self.pick_agent_key(key.code, action, idx);
+                None
+            }
+            Step::PickHost { agent, idx } => {
+                self.pick_host_key(key.code, agent, idx);
+                None
+            }
             Step::AgentActions { agent, idx } => {
-                let actions = self.agent_actions(&agent);
-                match key.code {
-                    KeyCode::Esc => self.step = Step::Menu,
-                    KeyCode::Up | KeyCode::Char('k') => self.step = Step::AgentActions { agent, idx: idx.saturating_sub(1) },
-                    KeyCode::Down | KeyCode::Char('j') => self.step = Step::AgentActions { agent, idx: (idx + 1).min(actions.len().saturating_sub(1)) },
-                    KeyCode::Enter => if let Some((_, _, outcome)) = actions.get(idx) { self.step = Step::Confirm(outcome.clone()); },
-                    KeyCode::Char(c) => if let Some((_, _, outcome)) = actions.iter().find(|(_, key, _)| *key == c) { self.step = Step::Confirm(outcome.clone()); },
-                    _ => {}
-                }
+                self.agent_actions_key(key.code, agent, idx);
+                None
             }
             Step::Confirm(outcome) => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.step = Step::Menu;
-                    return Some(outcome);
+                    Some(outcome)
                 }
-                KeyCode::Esc | KeyCode::Char('n') => self.step = Step::Menu,
-                _ => {}
-            },
-            Step::Rename(mut text) => match key.code {
-                KeyCode::Esc => self.step = Step::Menu,
-                KeyCode::Enter => {
+                KeyCode::Esc | KeyCode::Char('n') => {
                     self.step = Step::Menu;
-                    if !text.trim().is_empty() && text.trim() != self.data.title {
-                        return Some(Outcome::Rename(text.trim().to_string()));
-                    }
+                    None
                 }
-                KeyCode::Backspace => {
-                    text.pop();
-                    self.step = Step::Rename(text);
-                }
-                KeyCode::Char(c) => {
-                    text.push(c);
-                    self.step = Step::Rename(text);
-                }
-                _ => {}
+                _ => None,
             },
+            Step::Rename(text) => self.rename_key(key.code, text),
+        }
+    }
+
+    fn menu_key(&mut self, code: KeyCode) -> Option<Outcome> {
+        let actions = self.actions();
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => return Some(Outcome::Close),
+            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.cursor = (self.cursor + 1).min(actions.len().saturating_sub(1)),
+            KeyCode::Enter => {
+                let action = actions.get(self.cursor).copied()?;
+                self.start(action);
+            }
+            KeyCode::Char(c) => {
+                // Each row has a key of its own, shown beside it.
+                if let Some(a) = actions.iter().find(|a| a.key() == c.to_ascii_lowercase()) {
+                    self.start(*a);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn pick_agent_key(&mut self, code: KeyCode, action: Action, idx: usize) {
+        let candidates = self.data.agents.clone();
+        match code {
+            KeyCode::Esc => self.step = Step::Menu,
+            KeyCode::Up | KeyCode::Char('k') => self.step = Step::PickAgent { action, idx: idx.saturating_sub(1) },
+            KeyCode::Down | KeyCode::Char('j') => self.step = Step::PickAgent { action, idx: (idx + 1).min(candidates.len().saturating_sub(1)) },
+            KeyCode::Enter => {
+                if let Some(agent) = candidates.get(idx) { self.after_agent(action, agent.clone()); }
+            }
+            _ => {}
+        }
+    }
+
+    fn pick_host_key(&mut self, code: KeyCode, agent: String, idx: usize) {
+        // Only entered with more than one host to pick from (see `after_agent`).
+        assert!(idx < self.data.hosts.len(), "the host picked is listed");
+        match code {
+            KeyCode::Esc => self.step = Step::Menu,
+            KeyCode::Up | KeyCode::Char('k') => self.step = Step::PickHost { agent, idx: idx.saturating_sub(1) },
+            KeyCode::Down | KeyCode::Char('j') => self.step = Step::PickHost { agent, idx: (idx + 1).min(self.data.hosts.len() - 1) },
+            KeyCode::Enter => self.step = Step::Confirm(Outcome::Move { agent, host: self.data.hosts[idx].clone() }),
+            _ => {}
+        }
+    }
+
+    fn agent_actions_key(&mut self, code: KeyCode, agent: String, idx: usize) {
+        let actions = self.agent_actions(&agent);
+        match code {
+            KeyCode::Esc => self.step = Step::Menu,
+            KeyCode::Up | KeyCode::Char('k') => self.step = Step::AgentActions { agent, idx: idx.saturating_sub(1) },
+            KeyCode::Down | KeyCode::Char('j') => self.step = Step::AgentActions { agent, idx: (idx + 1).min(actions.len().saturating_sub(1)) },
+            KeyCode::Enter => if let Some((_, _, outcome)) = actions.get(idx) { self.step = Step::Confirm(outcome.clone()); },
+            KeyCode::Char(c) => if let Some((_, _, outcome)) = actions.iter().find(|(_, key, _)| *key == c) { self.step = Step::Confirm(outcome.clone()); },
+            _ => {}
+        }
+    }
+
+    fn rename_key(&mut self, code: KeyCode, mut text: String) -> Option<Outcome> {
+        match code {
+            KeyCode::Esc => self.step = Step::Menu,
+            KeyCode::Enter => {
+                self.step = Step::Menu;
+                if !text.trim().is_empty() && text.trim() != self.data.title {
+                    return Some(Outcome::Rename(text.trim().to_string()));
+                }
+            }
+            KeyCode::Backspace => {
+                text.pop();
+                self.step = Step::Rename(text);
+            }
+            KeyCode::Char(c) => {
+                text.push(c);
+                self.step = Step::Rename(text);
+            }
+            _ => {}
         }
         None
     }
@@ -313,7 +342,7 @@ impl ManageView {
     fn start(&mut self, action: Action) {
         match action {
             Action::Reset | Action::Move | Action::StopAgent => {
-                let candidates = self.agents_for(action);
+                let candidates = self.data.agents.clone();
                 if candidates.len() > 1 {
                     self.step = Step::PickAgent { action, idx: 0 };
                 } else if let Some(agent) = candidates.first().cloned() {
@@ -357,187 +386,249 @@ pub fn duration_label(secs: i64) -> String {
 pub fn render(frame: &mut Frame, v: &ManageView) {
     let area = frame.area();
     let width = area.width as usize;
-    let mut y = area.y;
-    let line_at = |frame: &mut Frame, y: u16, line: Line| {
-        if y < area.y + area.height {
-            frame.render_widget(Paragraph::new(line), Rect { x: area.x, y, width: area.width, height: 1 });
-        }
-    };
     let d = &v.data;
-    // Title line: the title left, state · age · sessions right.
-    let right = format!("{} · {} · {} session{}", d.state, d.age, d.sessions.len(), if d.sessions.len() == 1 { "" } else { "s" });
-    let title_w = width.saturating_sub(right.chars().count() + 2);
-    line_at(
-        frame,
-        y,
-        Line::from(vec![
-            Span::styled(format!("{:<title_w$}", ellipsize(&d.title, title_w)), theme::accent_bold()),
-            Span::styled(format!("  {right}"), theme::dim()),
-        ]),
-    );
-    y += 1;
-    if !d.projects.is_empty() {
-        line_at(frame, y, Line::from(Span::styled(d.projects.join(", "), theme::dim())));
-        y += 1;
+    let mut rows = Rows { frame, area, y: area.y };
+    render_title(&mut rows, d, width);
+    rows.push(Line::from(Span::styled("─".repeat(width), theme::dim())));
+    render_sessions(&mut rows, d, width);
+    render_totals(&mut rows, d, width);
+    rows.push(Line::from(Span::styled("─".repeat(width), theme::dim())));
+    render_step(&mut rows, v, width);
+    // The footer owns its row, whatever the menu left there.
+    let mut footer = footer_line(v);
+    let footer_width = footer.width();
+    if footer_width < width {
+        footer.spans.push(Span::raw(" ".repeat(width - footer_width)));
     }
-    line_at(frame, y, Line::from(Span::styled("─".repeat(width), theme::dim())));
-    y += 1;
-    // Sessions: columns drop from the right as the width shrinks.
-    let name_w = d.sessions.iter().map(|s| s.agent.chars().count()).max().unwrap_or(5).clamp(5, 12);
-    let runs_w = d.sessions.iter().map(|s| s.runs.chars().count()).max().unwrap_or(0).min(18);
-    let cols: &[(&str, usize)] = &[("state", 8), ("turns", 6), ("tools", 6), ("tokens", 7), ("cost", 8), ("ctx", 5), ("for", 8)];
-    let mut used = name_w + 1 + runs_w;
-    let mut shown: Vec<(&str, usize)> = Vec::new();
-    for (label, w) in cols {
-        if used + 1 + w <= width {
-            shown.push((label, *w));
-            used += 1 + w;
+    let footer_y = area.y + area.height.saturating_sub(1);
+    rows.put(footer_y, footer);
+}
+
+/// Lines written down the pane, one row each; past its bottom they are dropped.
+struct Rows<'a, 'f> {
+    frame: &'a mut Frame<'f>,
+    area: Rect,
+    y: u16,
+}
+
+impl Rows<'_, '_> {
+    fn push(&mut self, line: Line) {
+        self.put(self.y, line);
+        self.y = self.y.saturating_add(1);
+    }
+
+    fn put(&mut self, y: u16, line: Line) {
+        if y < self.area.y + self.area.height {
+            self.frame.render_widget(Paragraph::new(line), Rect { x: self.area.x, y, width: self.area.width, height: 1 });
         }
     }
-    let mut header = vec![Span::raw(" ".repeat(name_w + 1 + runs_w))];
-    for (label, w) in &shown {
-        header.push(Span::styled(format!(" {label:>w$}"), theme::dim()));
+}
+
+/// The title left, state · age · sessions right; the projects under it.
+fn render_title(rows: &mut Rows, d: &ManageData, width: usize) {
+    let sessions = if d.sessions.len() == 1 { t!("1 session").to_string() } else { t!("{n} sessions", n = d.sessions.len()) };
+    let right = format!("{} · {} · {sessions}", d.state, d.age);
+    let title_width = width.saturating_sub(text_width(&right) + 2);
+    rows.push(Line::from(vec![
+        Span::styled(pad_end(&ellipsize(&d.title, title_width), title_width), theme::accent_bold()),
+        Span::styled(format!("  {right}"), theme::dim()),
+    ]));
+    if !d.projects.is_empty() {
+        rows.push(Line::from(Span::styled(d.projects.join(", "), theme::dim())));
     }
-    line_at(frame, y, Line::from(header));
-    y += 1;
+}
+
+/// A column of the sessions table, after the agent and what it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionColumn {
+    State,
+    Turns,
+    Tools,
+    Tokens,
+    Cost,
+    Context,
+    Age,
+}
+
+impl SessionColumn {
+    /// Left to right; each shows only while it still fits.
+    const ALL: [SessionColumn; 7] = [Self::State, Self::Turns, Self::Tools, Self::Tokens, Self::Cost, Self::Context, Self::Age];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::State => t!("state"),
+            Self::Turns => t!("turns"),
+            Self::Tools => t!("tools"),
+            Self::Tokens => t!("tokens"),
+            Self::Cost => t!("cost"),
+            Self::Context => t!("ctx"),
+            Self::Age => t!("for"),
+        }
+    }
+
+    fn width_cols(self) -> usize {
+        match self {
+            Self::State | Self::Cost | Self::Age => 8,
+            Self::Turns | Self::Tools => 6,
+            Self::Tokens => 7,
+            // "上下文" takes six cells.
+            Self::Context => 6,
+        }
+    }
+
+    /// The cell for one session, and its style.
+    fn cell(self, s: &SessionRow) -> (String, Style) {
+        match self {
+            Self::State => {
+                let st = match (&s.host, s.live) {
+                    (Some(h), true) => format!("{}@{h}", s.state),
+                    _ => s.state.clone(),
+                };
+                (st, if s.live { theme::accent() } else { theme::dim() })
+            }
+            Self::Turns => (s.turns.to_string(), Style::default()),
+            Self::Tools => (s.tool_calls.to_string(), Style::default()),
+            Self::Tokens => (format_tokens(s.tokens), theme::bold()),
+            Self::Cost => (format!("${:.2}", s.cost_usd), theme::dim()),
+            Self::Context => match s.context {
+                Some((used, size)) if size > 0 => {
+                    let pct = (used as f64 / size as f64 * 100.0).round();
+                    (format!("{pct:.0}%"), if pct >= 80.0 { theme::danger() } else if pct >= 60.0 { theme::accent() } else { Style::default() })
+                }
+                _ => (String::new(), Style::default()),
+            },
+            Self::Age => (duration_label(s.duration_secs), theme::dim()),
+        }
+    }
+}
+
+/// Sessions: columns drop from the right as the width shrinks.
+fn render_sessions(rows: &mut Rows, d: &ManageData, width: usize) {
+    let name_width = d.sessions.iter().map(|s| text_width(&s.agent)).max().unwrap_or(5).clamp(5, 12);
+    let runs_width = d.sessions.iter().map(|s| text_width(&s.runs)).max().unwrap_or(0).min(18);
+    let mut used = name_width + 1 + runs_width;
+    let mut shown: Vec<SessionColumn> = Vec::new();
+    for column in SessionColumn::ALL {
+        if used + 1 + column.width_cols() <= width {
+            shown.push(column);
+            used += 1 + column.width_cols();
+        }
+    }
+    let mut header = vec![Span::raw(" ".repeat(name_width + 1 + runs_width))];
+    for column in &shown {
+        let (label, w) = (column.label(), column.width_cols());
+        header.push(Span::styled(format!(" {}", pad_start(label, w)), theme::dim()));
+    }
+    rows.push(Line::from(header));
     for s in &d.sessions {
         let mut spans = vec![
-            Span::styled(format!("{:<name_w$}", ellipsize(&s.agent, name_w)), Style::default().fg(theme::agent_color(s.color))),
-            Span::styled(format!(" {:<runs_w$}", ellipsize(&s.runs, runs_w)), theme::dim()),
+            Span::styled(pad_end(&ellipsize(&s.agent, name_width), name_width), Style::default().fg(theme::agent_color(s.color))),
+            Span::styled(format!(" {}", pad_end(&ellipsize(&s.runs, runs_width), runs_width)), theme::dim()),
         ];
-        for (label, w) in &shown {
-            let (text, style) = match *label {
-                "state" => {
-                    let st = match (&s.host, s.live) {
-                        (Some(h), true) => format!("{}@{h}", s.state),
-                        _ => s.state.clone(),
-                    };
-                    (st, if s.live { theme::accent() } else { theme::dim() })
-                }
-                "turns" => (s.turns.to_string(), Style::default()),
-                "tools" => (s.tool_calls.to_string(), Style::default()),
-                "tokens" => (format_tokens(s.tokens), theme::bold()),
-                "cost" => (format!("${:.2}", s.cost_usd), theme::dim()),
-                "ctx" => match s.context {
-                    Some((u, n)) if n > 0 => {
-                        let pct = (u as f64 / n as f64 * 100.0).round();
-                        (format!("{pct:.0}%"), if pct >= 80.0 { theme::danger() } else if pct >= 60.0 { theme::accent() } else { Style::default() })
-                    }
-                    _ => (String::new(), Style::default()),
-                },
-                _ => (duration_label(s.duration_secs), theme::dim()),
-            };
-            spans.push(Span::styled(format!(" {:>w$}", ellipsize(&text, *w)), style));
+        for column in &shown {
+            let (text, style) = column.cell(s);
+            let w = column.width_cols();
+            spans.push(Span::styled(format!(" {}", pad_start(&ellipsize(&text, w), w)), style));
         }
-        line_at(frame, y, Line::from(spans));
-        y += 1;
+        rows.push(Line::from(spans));
     }
-    // The thread as a whole, and the last hour.
-    let spark_w = width.saturating_sub(42).clamp(8, 30);
-    let peak = crate::view::chart::peak(&d.spark, spark_w);
-    let files = if d.files_changed > 0 { format!(" · {} files changed", d.files_changed) } else { String::new() };
+}
+
+/// The thread as a whole, and the last hour.
+fn render_totals(rows: &mut Rows, d: &ManageData, width: usize) {
+    let spark_width = width.saturating_sub(42).clamp(8, 30);
+    let peak = crate::view::chart::peak(&d.spark, spark_width);
+    let files = if d.files_changed > 0 { format!(" · {}", t!("{n} files changed", n = d.files_changed)) } else { String::new() };
+    let numbers = t!("{turns} turns · {calls} tool calls", turns = d.turns, calls = d.tool_calls);
     let mut spans = vec![
-        Span::styled(format!("{} tokens", format_tokens(d.tokens)), theme::bold()),
-        Span::styled(format!(" ${:.2} · {} turns · {} tool calls{files}  ", d.cost_usd, d.turns, d.tool_calls), theme::dim()),
+        Span::styled(t!("{n} tokens", n = format_tokens(d.tokens)), theme::bold()),
+        Span::styled(format!(" ${:.2} · {numbers}{files}  ", d.cost_usd), theme::dim()),
     ];
-    spans.extend(crate::view::chart::braille(&d.spark, spark_w, peak, theme::accent()));
-    line_at(frame, y, Line::from(spans));
-    y += 1;
-    line_at(frame, y, Line::from(Span::styled("─".repeat(width), theme::dim())));
-    y += 1;
-    // The menu, or the step in progress.
+    spans.extend(crate::view::chart::braille(&d.spark, spark_width, peak, theme::accent()));
+    rows.push(Line::from(spans));
+}
+
+/// The menu, or the step in progress.
+fn render_step(rows: &mut Rows, v: &ManageView, width: usize) {
+    let pick = |sel: bool, text: String| Line::from(Span::styled(format!("{} {text}", if sel { "›" } else { " " }), if sel { theme::accent_bold() } else { Style::default() }));
     match &v.step {
         Step::PickAgent { action, idx } => {
-            line_at(frame, y, Line::from(Span::styled(format!("{} which agent?", action.label()), theme::accent_bold())));
-            y += 1;
-            for (i, a) in v.agents_for(*action).iter().enumerate() {
-                let sel = i == *idx;
-                line_at(frame, y, Line::from(Span::styled(format!("{} {a}", if sel { "›" } else { " " }), if sel { theme::accent_bold() } else { Style::default() })));
-                y += 1;
+            rows.push(Line::from(Span::styled(t!("{action} which agent?", action = action.label()), theme::accent_bold())));
+            for (i, a) in v.data.agents.iter().enumerate() {
+                rows.push(pick(i == *idx, a.clone()));
             }
         }
         Step::AgentActions { agent, idx } => {
-            line_at(frame, y, Line::from(Span::styled(format!("{agent} · agent controls"), theme::accent_bold())));
-            y += 1;
+            rows.push(Line::from(Span::styled(t!("{agent} · agent controls", agent = agent), theme::accent_bold())));
             for (i, (label, key, outcome)) in v.agent_actions(agent).iter().enumerate() {
                 let destructive = matches!(outcome, Outcome::StopAgent { .. } | Outcome::RemoveAgent { .. });
                 let style = if destructive { theme::danger() } else if i == *idx { theme::accent_bold() } else { Style::default() };
-                line_at(frame, y, Line::from(Span::styled(format!("{} {key} {label}", if i == *idx { "›" } else { " " }), style)));
-                y += 1;
+                rows.push(Line::from(Span::styled(format!("{} {key} {label}", if i == *idx { "›" } else { " " }), style)));
             }
         }
         Step::PickHost { agent, idx } => {
-            line_at(frame, y, Line::from(Span::styled(format!("move {agent} where?"), theme::accent_bold())));
-            y += 1;
-            for (i, h) in d.hosts.iter().enumerate() {
-                let sel = i == *idx;
-                line_at(frame, y, Line::from(Span::styled(format!("{} {h}", if sel { "›" } else { " " }), if sel { theme::accent_bold() } else { Style::default() })));
-                y += 1;
+            rows.push(Line::from(Span::styled(t!("move {agent} where?", agent = agent), theme::accent_bold())));
+            for (i, h) in v.data.hosts.iter().enumerate() {
+                rows.push(pick(i == *idx, h.clone()));
             }
         }
-        _ => {
-            let actions = v.actions();
-            let label_w = 11;
-            for (i, a) in actions.iter().enumerate() {
-                let sel = i == v.cursor && v.step == Step::Menu;
-                let marker = if sel { "› " } else { "  " };
-                let desc = ellipsize(&v.describe(*a), width.saturating_sub(label_w + 6));
-                let (label_style, desc_style) = match (a.is_destructive(), sel) {
-                    (true, true) => (theme::danger().add_modifier(ratatui::style::Modifier::BOLD), theme::danger()),
-                    (true, false) => (theme::danger(), theme::dim()),
-                    (false, true) => (theme::accent_bold(), Style::default()),
-                    (false, false) => (theme::bold(), theme::dim()),
-                };
-                line_at(
-                    frame,
-                    y,
-                    Line::from(vec![
-                        Span::styled(marker, if a.is_destructive() { theme::danger() } else { theme::accent() }),
-                        Span::styled(format!("{} ", a.key()), theme::dim()),
-                        Span::styled(format!("{:<label_w$}", a.label()), label_style),
-                        Span::styled(desc, desc_style),
-                    ]),
-                );
-                y += 1;
-            }
-        }
+        _ => render_menu(rows, v, width),
     }
-    // Footer.
-    let footer_y = area.y + area.height.saturating_sub(1);
-    let footer = match &v.step {
+}
+
+fn render_menu(rows: &mut Rows, v: &ManageView, width: usize) {
+    const LABEL_WIDTH: usize = 11;
+    for (i, a) in v.actions().iter().enumerate() {
+        let sel = i == v.cursor && v.step == Step::Menu;
+        let marker = if sel { "› " } else { "  " };
+        let desc = ellipsize(&v.describe(*a), width.saturating_sub(LABEL_WIDTH + 6));
+        let (label_style, desc_style) = match (a.is_destructive(), sel) {
+            (true, true) => (theme::danger().add_modifier(ratatui::style::Modifier::BOLD), theme::danger()),
+            (true, false) => (theme::danger(), theme::dim()),
+            (false, true) => (theme::accent_bold(), Style::default()),
+            (false, false) => (theme::bold(), theme::dim()),
+        };
+        rows.push(Line::from(vec![
+            Span::styled(marker, if a.is_destructive() { theme::danger() } else { theme::accent() }),
+            Span::styled(format!("{} ", a.key()), theme::dim()),
+            Span::styled(pad_end(a.label(), LABEL_WIDTH), label_style),
+            Span::styled(desc, desc_style),
+        ]));
+    }
+}
+
+/// The question to confirm, the title being typed, or the keys for the step.
+fn footer_line(v: &ManageView) -> Line<'static> {
+    match &v.step {
         Step::Confirm(o) => {
-            let what = match o {
-                Outcome::Reset { agent } => format!("reset: end the thread's sessions and start {agent} fresh with a recap?"),
-                Outcome::Move { agent, host } => format!("move {agent} to {host}?"),
-                Outcome::Settle => "settle this thread?".into(),
-                Outcome::Reopen => "reopen this thread?".into(),
-                Outcome::Archive => "archive this thread: stop its sessions and hide it?".into(),
-                Outcome::Stop => "stop every live session?".into(),
-                Outcome::StopAgent { agent } => format!("kill {agent}'s live sessions on this thread?"),
-                Outcome::PauseAgent { agent } => format!("pause {agent} in place, including its running tools?"),
-                Outcome::ResumeAgent { agent } => format!("resume {agent}'s paused work?"),
-                Outcome::RemoveAgent { agent } => format!("stop {agent} and remove it from this thread? Its history is kept."),
-                Outcome::Rename(t) => format!("rename to {t}?"),
-                Outcome::HardReset => "hard reset: end every session, relaunch the panes, start nobody; the conversation is not carried over?".into(),
-                Outcome::Close => String::new(),
-            };
             let style = if matches!(o, Outcome::HardReset) { theme::danger().add_modifier(ratatui::style::Modifier::BOLD) } else { theme::accent_bold() };
-            Line::from(Span::styled(format!("{what}  y/n"), style))
+            Line::from(Span::styled(format!("{}  y/n", confirm_question(o)), style))
         }
-        Step::Rename(text) => Line::from(vec![Span::styled("title: ", theme::accent()), Span::raw(text.clone()), Span::styled("▏", theme::accent())]),
-        Step::PickAgent { .. } | Step::PickHost { .. } | Step::AgentActions { .. } => Line::from(Span::styled("↑↓ choose  ⏎ pick  Esc back", theme::dim())),
-        Step::Menu => match &d.note {
+        Step::Rename(text) => Line::from(vec![Span::styled(format!("{} ", t!("title:")), theme::accent()), Span::raw(text.clone()), Span::styled("▏", theme::accent())]),
+        Step::PickAgent { .. } | Step::PickHost { .. } | Step::AgentActions { .. } => Line::from(Span::styled(t!("↑↓ choose  ⏎ pick  Esc back"), theme::dim())),
+        Step::Menu => match &v.data.note {
             Some(n) => Line::from(Span::styled(n.clone(), theme::accent())),
-            None => Line::from(Span::styled("↑↓ choose  ⏎ go  Esc close", theme::dim())),
+            None => Line::from(Span::styled(t!("↑↓ choose  ⏎ go  Esc close"), theme::dim())),
         },
-    };
-    // The footer owns its row, whatever the menu left there.
-    let mut footer = footer;
-    let w = footer.width();
-    if w < width {
-        footer.spans.push(Span::raw(" ".repeat(width - w)));
     }
-    line_at(frame, footer_y, footer);
+}
+
+fn confirm_question(o: &Outcome) -> String {
+    match o {
+        Outcome::Reset { agent } => t!("reset: end the thread's sessions and start {agent} fresh with a recap?", agent = agent),
+        Outcome::Move { agent, host } => t!("move {agent} to {host}?", agent = agent, host = host),
+        Outcome::Settle => t!("settle this thread?").into(),
+        Outcome::Reopen => t!("reopen this thread?").into(),
+        Outcome::Archive => t!("archive this thread: stop its sessions and hide it?").into(),
+        Outcome::Stop => t!("stop every live session?").into(),
+        Outcome::StopAgent { agent } => t!("kill {agent}'s live sessions on this thread?", agent = agent),
+        Outcome::PauseAgent { agent } => t!("pause {agent} in place, including its running tools?", agent = agent),
+        Outcome::ResumeAgent { agent } => t!("resume {agent}'s paused work?", agent = agent),
+        Outcome::RemoveAgent { agent } => t!("stop {agent} and remove it from this thread? Its history is kept.", agent = agent),
+        Outcome::Rename(title) => t!("rename to {title}?", title = title),
+        Outcome::HardReset => t!("hard reset: end every session, relaunch the panes, start nobody; the conversation is not carried over?").into(),
+        Outcome::Close => String::new(),
+    }
 }
 
 /// Run the pane until it has something for the caller.

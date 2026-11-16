@@ -9,8 +9,9 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::items::{ITEM_COLS, row_item};
+use crate::local::{ENV_COLS, row_environment};
 use crate::log::{EVENT_COLS, row_envelope};
-use crate::{ConversationItem, Environment, Error, Store, now};
+use crate::{ConversationItem, Environment, Error, Store, now, sql_limit};
 
 /// One change to a conversation item, in revision order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,20 +48,6 @@ impl SyncStream {
             SyncStream::ItemsIn => "items_in",
         }
     }
-}
-
-const ENV_COLS: &str = "id, label, rex_host_id, is_local, created_at, ssh_target, host_pubkey";
-
-fn row_env(r: &rusqlite::Row<'_>) -> rusqlite::Result<Environment> {
-    Ok(Environment {
-        id: r.get("id")?,
-        label: r.get("label")?,
-        rex_host_id: r.get("rex_host_id")?,
-        is_local: r.get::<_, i64>("is_local")? != 0,
-        created_at: r.get("created_at")?,
-        ssh_target: r.get("ssh_target")?,
-        host_pubkey: r.get("host_pubkey")?,
-    })
 }
 
 impl Store {
@@ -112,7 +99,7 @@ impl Store {
     pub fn environment(&self, id: &str) -> Result<Option<Environment>, Error> {
         Ok(self
             .conn
-            .query_row(&format!("SELECT {ENV_COLS} FROM environments WHERE id = ?1"), [id], row_env)
+            .query_row(&format!("SELECT {ENV_COLS} FROM environments WHERE id = ?1"), [id], row_environment)
             .optional()?)
     }
 
@@ -123,7 +110,7 @@ impl Store {
             .query_row(
                 &format!("SELECT {ENV_COLS} FROM environments WHERE is_local = 0 AND label = ?1"),
                 [label],
-                row_env,
+                row_environment,
             )
             .optional()?)
     }
@@ -131,7 +118,7 @@ impl Store {
     /// Every remote host, by label.
     pub fn hosts(&self) -> Result<Vec<Environment>, Error> {
         let mut st = self.conn.prepare(&format!("SELECT {ENV_COLS} FROM environments WHERE is_local = 0 ORDER BY label"))?;
-        let rows = st.query_map([], row_env)?;
+        let rows = st.query_map([], row_environment)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -257,6 +244,10 @@ impl Store {
     /// Envelopes on `threads` with `seq > cursor`, oldest first.  `None`
     /// means every envelope that is on a thread.
     pub fn thread_events_since(&self, cursor: i64, threads: Option<&[String]>, limit: usize) -> Result<Vec<(i64, Envelope)>, Error> {
+        // The loop checks the limit after a push, so it would return one.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let mut st = self.conn.prepare(&format!(
             "SELECT seq, thread_id, {EVENT_COLS} FROM events WHERE seq > ?1 AND thread_id IS NOT NULL ORDER BY seq ASC"
@@ -289,7 +280,7 @@ impl Store {
             "SELECT ci.rev AS rev, {cols} FROM conversation_items ci JOIN sessions s ON s.id = ci.session_id
              WHERE s.environment_id = ?1 AND ci.rev > ?2 ORDER BY ci.rev ASC LIMIT ?3"
         ))?;
-        let rows = st.query_map(params![environment_id, cursor, limit as i64], |r| {
+        let rows = st.query_map(params![environment_id, cursor, sql_limit(limit)], |r| {
             Ok(ItemChange::Upsert { rev: r.get("rev")?, item: row_item(r)? })
         })?;
         let mut out: Vec<ItemChange> = rows.collect::<Result<_, _>>()?;
@@ -297,7 +288,7 @@ impl Store {
             "SELECT t.rev, t.id FROM item_tombstones t JOIN sessions s ON s.id = t.session_id
              WHERE s.environment_id = ?1 AND t.rev > ?2 ORDER BY t.rev ASC LIMIT ?3",
         )?;
-        let rows = st.query_map(params![environment_id, cursor, limit as i64], |r| {
+        let rows = st.query_map(params![environment_id, cursor, sql_limit(limit)], |r| {
             Ok(ItemChange::Delete { rev: r.get(0)?, id: r.get(1)? })
         })?;
         for r in rows {

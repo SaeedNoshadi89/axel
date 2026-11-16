@@ -10,19 +10,21 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Responder};
 use anyhow::{Context, Result};
+use axel_i18n::t;
 use axel_identity::Keypair;
 use axel_store::{
     BlockedKind, ConversationItem, Harness, ItemKind, ItemStatus, NewItem, RuntimeMode,
     SessionState, SessionUpdate, StatusReport, StatusState, Store, TurnChanges, TurnSummary,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::adapter::{adapter_command, runs_builtin_adapter};
+use crate::agent_rpc::LineRead;
 use crate::checkpoint;
 use crate::usage::TurnUsage;
 use crate::attach::{self, PromptCaps};
@@ -124,7 +126,7 @@ fn meta_with_effort(
             axel["effort"] = json!(level);
             (Some(meta), None)
         }
-        None => (meta, Some(format!("could not set effort {effort}: {} has no such level; it runs at its default", harness.label()))),
+        None => (meta, Some(t!("could not set effort {effort}: {harness} has no such level; it runs at its default", effort = effort, harness = harness.label()))),
     }
 }
 
@@ -175,14 +177,12 @@ fn select_values(options: &[Value]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// How a warning ends when the host could not change a session's effort:
-/// the level stays what the harness has it at, which the selector's
-/// `currentValue` names when it reports one. That is often not the default.
-fn effort_left_at(selector: Option<&Value>) -> String {
-    match selector.and_then(|s| s.get("currentValue")).and_then(Value::as_str).filter(|current| !current.is_empty()) {
-        Some(current) => format!("it stays at {current}"),
-        None => "its effort is unchanged".to_string(),
-    }
+/// The level a session stays at when the host could not change its effort:
+/// what the harness has it at, which the selector's `currentValue` names
+/// when it reports one. That is often not the default. `None` when it
+/// reports none, and the warning says the effort is unchanged.
+fn effort_left_at(selector: &Value) -> Option<&str> {
+    selector.get("currentValue").and_then(Value::as_str).filter(|current| !current.is_empty())
 }
 
 /// Whether an advertised value or name is `effort`: `high`, `High`, `x-high`.
@@ -238,12 +238,11 @@ pub fn native_mode(mode: RuntimeMode) -> &'static str {
     }
 }
 
-/// Raw input / output stored on tool-call items is cut at this many bytes.
 /// Stored tool input and output stop at this many bytes (a read file, a
 /// command's output): enough to see it, not the store's whole size.
-const RAW_LIMIT: usize = 16 * 1024;
+const RAW_LIMIT_BYTES: usize = 16 * 1024;
 /// `TurnSummary.assistant_text` keeps this many chars.
-const ASSISTANT_HEAD: usize = 2000;
+const ASSISTANT_HEAD_CHARS: usize = 2000;
 
 /// Host one managed session until it is stopped, the adapter exits, or the
 /// host's stdin (the pane) closes.  See the crate docs for what it does.
@@ -257,52 +256,52 @@ pub async fn run_host(
         FrameLog::open(&cfg.log_path)
             .with_context(|| format!("opening frame log {}", cfg.log_path.display()))?,
     );
+    // Unbounded on purpose: the ACP connection's handlers must never wait on
+    // the loop (it may be awaiting them), and what goes in is bounded by its
+    // sources: one adapter's frames, socket commands (at most
+    // `CONNECTIONS_MAX` in flight) and the pane's EOF.
     let (tx, rx) = mpsc::unbounded_channel::<Event>();
 
     // Adapter.
     let cmd = adapter_command(&cfg.harness);
-    let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<String>();
+    let (stderr_tx, stderr_rx) = mpsc::unbounded_channel::<String>();
     let (child, transport_) = transport::spawn(&cmd, &cfg.cwd, &cfg.env, log.clone(), stderr_tx)?;
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Some(line) = stderr_rx.recv().await {
-                if tx.send(Event::Stderr(line)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    forward_stderr(stderr_rx, tx.clone());
 
-    // Command socket.
-    if let Some(parent) = cfg.socket_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let _ = std::fs::remove_file(&cfg.socket_path);
-    let listener = UnixListener::bind(&cfg.socket_path)
-        .with_context(|| format!("binding {}", cfg.socket_path.display()))?;
+    let listener = bind_socket(&cfg.socket_path)?;
     let socket_task = tokio::spawn(serve_socket(listener, tx.clone()));
-
     // The pane closing shows up as EOF on our stdin — only meaningful when stdin is a terminal.
     if std::io::stdin().is_terminal() {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
-            let _ = tx.send(Event::StdinClosed);
-        });
+        watch_pane(tx.clone());
     }
 
     let socket_path = cfg.socket_path.clone();
     let mut host = Host::new(cfg, store, signer, out, cmd);
-    host.line(CYAN, "●", &format!("adapter: {}", host.adapter.join(" ")));
+    host.line(CYAN, "●", &t!("adapter: {command}", command = host.adapter.join(" ")));
+    let reason = serve_agent(&mut host, transport_, rx, &tx).await;
 
-    let tx_notif = tx.clone();
-    let tx_ext = tx.clone();
-    let tx_perm = tx.clone();
+    socket_task.abort();
+    host.finish(&reason);
+    if let Err(e) = std::fs::remove_file(&socket_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        host.line(RED, "✖", &t!("removing {path}: {error}", path = socket_path.display(), error = e));
+    }
+    end_process_group(&child);
+    drop(child); // kill_on_drop
+    Ok(())
+}
+
+/// Connect to the adapter over `transport` and run the host until it stops;
+/// the reason it stopped.  The agent's notifications and requests become
+/// events on `tx`, but for file reads and writes, answered here.
+async fn serve_agent<W: Write + Send>(
+    host: &mut Host<W>,
+    transport: impl ConnectTo<Client> + 'static,
+    rx: mpsc::UnboundedReceiver<Event>,
+    tx: &mpsc::UnboundedSender<Event>,
+) -> String {
+    let (tx_notif, tx_ext, tx_perm) = (tx.clone(), tx.clone(), tx.clone());
     let cwd = host.cfg.cwd.clone();
     let cwd2 = cwd.clone();
     // Shared with the fs handler so a mid-session mode switch reaches writes.
@@ -312,6 +311,7 @@ pub async fn run_host(
         .name("axel")
         .on_receive_notification(
             async move |n: acp::SessionNotification, _cx: ConnectionTo<Agent>| {
+                // The loop is gone only when the host is shutting down.
                 let _ = tx_notif.send(Event::Update(n));
                 Ok(())
             },
@@ -320,6 +320,7 @@ pub async fn run_host(
         .on_receive_notification(
             async move |n: agent_client_protocol::UntypedMessage, _cx: ConnectionTo<Agent>| {
                 if n.method().starts_with("_axel/") {
+                    // The loop is gone only when the host is shutting down.
                     let _ = tx_ext.send(Event::Ext { method: n.method().to_string(), params: n.params().clone() });
                 }
                 Ok(())
@@ -330,24 +331,13 @@ pub async fn run_host(
             async move |req: acp::RequestPermissionRequest,
                         responder: Responder<acp::RequestPermissionResponse>,
                         _cx: ConnectionTo<Agent>| {
+                // No loop to ask, or it dropped the question: cancelled.
                 let (reply_tx, reply_rx) = oneshot::channel();
-                if tx_perm
-                    .send(Event::Permission {
-                        req,
-                        reply: reply_tx,
-                    })
-                    .is_err()
-                {
-                    return responder.respond(acp::RequestPermissionResponse::new(
-                        acp::RequestPermissionOutcome::Cancelled,
-                    ));
-                }
-                match reply_rx.await {
-                    Ok(resp) => responder.respond(resp),
-                    Err(_) => responder.respond(acp::RequestPermissionResponse::new(
-                        acp::RequestPermissionOutcome::Cancelled,
-                    )),
-                }
+                let resp = match tx_perm.send(Event::Permission { req, reply: reply_tx }) {
+                    Ok(()) => reply_rx.await.unwrap_or_else(|_| selected_or_cancelled(None)),
+                    Err(_) => selected_or_cancelled(None),
+                };
+                responder.respond(resp)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -363,34 +353,69 @@ pub async fn run_host(
             async move |req: acp::WriteTextFileRequest,
                         responder: Responder<acp::WriteTextFileResponse>,
                         _cx: ConnectionTo<Agent>| {
-                let mode = *mode_cell.lock().expect("mode lock");
+                let mode = *mode_cell.lock().expect("mode lock: never held across a panic");
                 fs_write(&cwd2, mode, req, responder).await
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .connect_with(transport_, async |cx: ConnectionTo<Agent>| {
+        .connect_with(transport, async |cx: ConnectionTo<Agent>| {
             let reason = host.run(&cx, rx).await;
             Ok::<String, acp::Error>(reason)
         })
         .await;
-
-    let reason = match connected {
+    match connected {
         Ok(reason) => reason,
         Err(e) => format!("connection error: {e}"),
-    };
-    socket_task.abort();
-    host.finish(&reason);
-    let _ = std::fs::remove_file(&socket_path);
-    // The adapter and everything it started (Claude, `npx` wrappers) share a
-    // process group: end the group, so no harness outlives its session.
-    if let Some(pid) = child.id() {
+    }
+}
+
+/// The adapter's stderr lines, as events for the pane.
+fn forward_stderr(mut stderr_rx: mpsc::UnboundedReceiver<String>, tx: mpsc::UnboundedSender<Event>) {
+    tokio::spawn(async move {
+        while let Some(line) = stderr_rx.recv().await {
+            if tx.send(Event::Stderr(line)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// The command socket at `path`, in place of any left by a host that died.
+fn bind_socket(path: &Path) -> Result<UnixListener> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // A socket left by a host that died; none is the usual case, and a real
+    // problem with the path shows in `bind` below.
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+}
+
+/// Send `StdinClosed` when the host's pane closes (its stdin ends).
+fn watch_pane(tx: mpsc::UnboundedSender<Event>) {
+    std::thread::spawn(move || {
+        // Nothing is typed into the host's pane: whatever is, is thrown
+        // away, so this holds no memory, and EOF and a read error both
+        // mean the pane is gone.
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        // The loop may have ended already; then there is nobody to stop.
+        let _ = tx.send(Event::StdinClosed);
+    });
+}
+
+/// The adapter and everything it started (Claude, `npx` wrappers) share a
+/// process group: end the group, so no harness outlives its session.
+fn end_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
         // SAFETY: signalling a process group we created (`process_group(0)`).
+        // It may be gone already (ESRCH): then there is nothing left to end.
         unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+            libc::killpg(pid, libc::SIGTERM);
         }
     }
-    drop(child); // kill_on_drop
-    Ok(())
 }
 
 // --- events ------------------------------------------------------------------
@@ -426,6 +451,57 @@ enum Action {
     Stop,
 }
 
+/// How a turn ended: what the thread, the status and the pane say about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnOutcome {
+    /// The agent finished (`end_turn`).
+    Finished,
+    /// The agent stopped short of finishing (`max_tokens`,
+    /// `max_turn_requests`, `refusal`): the turn is done, and says why.
+    StoppedShort,
+    /// The owner cancelled it (`cancelled`).
+    Cancelled,
+    /// The prompt request failed: no stop reason at all.
+    Failed,
+}
+
+impl TurnOutcome {
+    fn of(stop_reason: acp::StopReason) -> TurnOutcome {
+        match stop_reason {
+            acp::StopReason::EndTurn => TurnOutcome::Finished,
+            acp::StopReason::Cancelled => TurnOutcome::Cancelled,
+            _ => TurnOutcome::StoppedShort,
+        }
+    }
+
+    /// The status of the turn's `TurnEnd` item.
+    fn item_status(self) -> ItemStatus {
+        match self {
+            TurnOutcome::Finished | TurnOutcome::StoppedShort => ItemStatus::Completed,
+            TurnOutcome::Cancelled => ItemStatus::Cancelled,
+            TurnOutcome::Failed => ItemStatus::Failed,
+        }
+    }
+}
+
+/// A reply that refuses a command, saying why.
+fn error_reply(message: impl Into<String>) -> Reply {
+    Reply::Error { message: message.into() }
+}
+
+/// ` · 3 files +10 −2` for a turn's line in the pane, when it changed files.
+fn changes_note(changes: Option<&TurnChanges>) -> String {
+    let Some(c) = changes.filter(|c| !c.files.is_empty()) else { return String::new() };
+    let (added, removed) = c.totals();
+    let count = c.files.len();
+    let files = if count == 1 {
+        t!("1 file +{added} −{removed}", added = added, removed = removed)
+    } else {
+        t!("{count} files +{added} −{removed}", count = count, added = added, removed = removed)
+    };
+    format!(" · {files}")
+}
+
 struct TextItem {
     id: String,
     kind: ItemKind,
@@ -444,14 +520,83 @@ struct Queued {
 struct PendingPermission {
     reply: oneshot::Sender<acp::RequestPermissionResponse>,
     title: String,
-    /// `(option_id, kind)` with kind as the protocol string.
-    options: Vec<(String, String)>,
+    /// `(option_id, kind)` of each option offered.
+    options: Vec<(String, acp::PermissionOptionKind)>,
     multiple: Option<(usize,usize)>,
+}
+
+/// The tool call a permission request is about.
+struct PermissionCall {
+    /// The ACP `toolCallId`.
+    ref_id: String,
+    title: String,
+    kind: ToolKind,
+    raw_input: Value,
+}
+
+impl PermissionCall {
+    /// The `ref_id` of its `Permission` item: never the tool call's own, so
+    /// tool call updates never touch it.
+    fn permission_ref(&self) -> String {
+        format!("permission:{}", self.ref_id)
+    }
+
+    /// The title, with the gist of the input, for the pane.
+    fn label(&self) -> String {
+        let summary = input_summary(&self.raw_input);
+        if summary.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{}  {DIM}{summary}{RESET}", self.title)
+        }
+    }
+}
+
+fn is_allow(kind: acp::PermissionOptionKind) -> bool {
+    matches!(kind, acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways)
+}
+
+fn is_reject(kind: acp::PermissionOptionKind) -> bool {
+    matches!(kind, acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways)
+}
+
+/// The option of kind `prefer`, else the first of its family.
+fn pick_option(options: &[(String, acp::PermissionOptionKind)], prefer: acp::PermissionOptionKind, family: fn(acp::PermissionOptionKind) -> bool) -> Option<String> {
+    debug_assert!(family(prefer), "the preferred kind belongs to its family");
+    options
+        .iter()
+        .find(|(_, kind)| *kind == prefer)
+        .or_else(|| options.iter().find(|(_, kind)| family(*kind)))
+        .map(|(id, _)| id.clone())
+}
+
+/// The answer that picks `option_id`, or cancels when there is none to pick.
+fn selected_or_cancelled(option_id: Option<String>) -> acp::RequestPermissionResponse {
+    let outcome = match option_id {
+        Some(id) => acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(acp::PermissionOptionId::new(id))),
+        None => acp::RequestPermissionOutcome::Cancelled,
+    };
+    acp::RequestPermissionResponse::new(outcome)
+}
+
+/// How many choices a multi-select question takes, `(min, max)`; `None`
+/// for a question with one answer.  Bounds the choices can't meet are an error.
+fn selection_bounds(raw_input: &Value, options: &[(String, acp::PermissionOptionKind)]) -> Result<Option<(usize, usize)>> {
+    if raw_input.get("multiSelect").and_then(Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    let count = options.iter().filter(|(_, kind)| is_allow(*kind)).count();
+    // Saturating: an absurd bound fails the check below rather than wrapping.
+    let bound = |key: &str| raw_input.get(key).and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let min = bound("minSelections").unwrap_or(1);
+    let max = bound("maxSelections").unwrap_or(count);
+    anyhow::ensure!(min <= max && max <= count, "invalid question selection bounds");
+    Ok(Some((min, max)))
 }
 
 /// Composite answers are an Axel extension for explicit multi-select questions,
 /// never a way to select unoffered options or combine permission grants.
-fn validate_answer(options: &[(String,String)], multiple: Option<(usize,usize)>, answer: &str) -> Result<bool> {
+fn validate_answer(options: &[(String, acp::PermissionOptionKind)], multiple: Option<(usize,usize)>, answer: &str) -> Result<bool> {
     if let Some(encoded)=answer.strip_prefix(crate::claude::MULTI_ANSWER_PREFIX) {
         let Some((min,max))=multiple else { anyhow::bail!("this question does not allow multiple selections") };
         let ids:Vec<String>=serde_json::from_str(encoded)?;
@@ -459,12 +604,12 @@ fn validate_answer(options: &[(String,String)], multiple: Option<(usize,usize)>,
         let unique:std::collections::HashSet<_>=ids.iter().collect();
         anyhow::ensure!(unique.len()==ids.len(),"duplicate selections");
         for id in ids {
-            anyhow::ensure!(options.iter().any(|(offered,kind)|offered==&id && kind.starts_with("allow")),"option {id} is not an offered selection");
+            anyhow::ensure!(options.iter().any(|(offered,kind)|offered==&id && is_allow(*kind)),"option {id} is not an offered selection");
         }
         return Ok(true)
     }
     let Some((_,kind))=options.iter().find(|(id,_)|id==answer) else { anyhow::bail!("option {answer} is not offered") };
-    let allowed=kind.starts_with("allow");
+    let allowed=is_allow(*kind);
     if allowed && let Some((min,max))=multiple {anyhow::ensure!(min<=1 && max>=1,"select {min}–{max} options");}
     Ok(allowed)
 }
@@ -480,6 +625,18 @@ const YELLOW: &str = "\x1b[33m";
 const BLUE: &str = "\x1b[34m";
 const MAGENTA: &str = "\x1b[35m";
 const CYAN: &str = "\x1b[36m";
+
+/// The most items read back to find a turn's last message: far more than
+/// any session holds, so the newest are always in it.
+const SESSION_ITEMS_MAX: usize = 100_000;
+
+/// Prompts that may wait at once, queued or sent into the turn.  A person
+/// queues a handful; past this, something (a script, two agents answering
+/// each other) is looping, and its prompts are refused.
+const QUEUED_MAX: usize = 64;
+
+/// How long a stopping host waits for the socket's last reply to go out.
+const STOP_DRAIN: Duration = Duration::from_millis(50);
 
 /// A returned answer is cut to this many characters.
 const REPLY_MAX_CHARS: usize = 8000;
@@ -524,7 +681,9 @@ struct Host<W: Write> {
     session_cost: f64,
     /// Standard cumulative cost takes precedence over adapter extensions.
     standard_cost_seen: bool,
-    cur_text: Option<TextItem>,
+    /// The message or thought being streamed, until another kind of
+    /// update closes it.
+    open_text: Option<TextItem>,
     /// Pending `Permission` items by item id.  Permission items carry
     /// `ref_id = "permission:<toolCallId>"` so tool-call updates never touch them.
     pending: HashMap<String, PendingPermission>,
@@ -584,7 +743,7 @@ impl<W: Write> Host<W> {
             turn_progress: false,
             session_cost,
             standard_cost_seen: false,
-            cur_text: None,
+            open_text: None,
             pending: HashMap::new(),
             queue: VecDeque::new(),
             can_steer: false,
@@ -599,10 +758,22 @@ impl<W: Write> Host<W> {
 
     // --- output ---
 
+    /// Write to the host's pane.  The pane only shows what happens: a write
+    /// that fails (it was closed) must not stop the session, whose record is
+    /// the store, so the error is dropped here, once for every writer.
+    fn emit(&mut self, args: std::fmt::Arguments<'_>) {
+        let _ = self.out.write_fmt(args);
+        let _ = self.out.flush();
+    }
+
     fn line(&mut self, colour: &str, glyph: &str, text: &str) {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        let _ = writeln!(self.out, "{DIM}{ts}{RESET} {colour}{glyph}{RESET} {text}");
-        let _ = self.out.flush();
+        self.emit(format_args!("{DIM}{ts}{RESET} {colour}{glyph}{RESET} {text}\n"));
+    }
+
+    /// A store write that failed: said in the pane, the session goes on.
+    fn store_failed(&mut self, error: &dyn std::fmt::Display) {
+        self.line(RED, "✖", &t!("store: {error}", error = error));
     }
 
     /// A desktop notification (OSC 9) for the terminal the host runs in, when
@@ -613,8 +784,7 @@ impl<W: Write> Host<W> {
             return;
         }
         let clean: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
-        let _ = write!(self.out, "\x1b]9;{clean}\x07");
-        let _ = self.out.flush();
+        self.emit(format_args!("\x1b]9;{clean}\x07"));
     }
 
     /// Report this session's state to the terminal its pane runs in, as an
@@ -635,14 +805,13 @@ impl<W: Write> Host<W> {
             title: Some(&title),
             msg: (!msg.is_empty()).then_some(msg),
         };
-        let _ = write!(self.out, "{}", axel_rex::osc::encode(&report));
-        let _ = self.out.flush();
+        let encoded = axel_rex::osc::encode(&report);
+        self.emit(format_args!("{encoded}"));
     }
 
     fn dim(&mut self, text: &str) {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        let _ = writeln!(self.out, "{DIM}{ts}   {text}{RESET}");
-        let _ = self.out.flush();
+        self.emit(format_args!("{DIM}{ts}   {text}{RESET}\n"));
     }
 
     // --- the loop ---
@@ -661,78 +830,36 @@ impl<W: Write> Host<W> {
             }
             Ok(None) => {}
             Err(e) => {
-                self.line(RED, "✖", &format!("setup failed: {e:#}"));
+                let error = format!("{e:#}");
+                self.line(RED, "✖", &t!("setup failed: {error}", error = error));
                 // On the thread too: otherwise the agent just shows as done.
-                let msg = setup_failure_message(&self.cfg.harness, &format!("{e:#}"));
-                if let Err(err) = self.push(ItemKind::Error, Some(ItemStatus::Failed), None, json!({ "message": msg })) {
-                    self.line(RED, "✖", &format!("store: {err}"));
-                }
-                return format!("setup failed: {e:#}");
+                let msg = setup_failure_message(&self.cfg.harness, &error);
+                self.record_error(&msg);
+                // The session's stored end reason: kept in English, like the others.
+                return format!("setup failed: {error}");
             }
         }
         loop {
             tokio::select! {
                 ev = rx.recv() => {
                     let Some(ev) = ev else { return "host channel closed".into() };
-                    match self.handle_event(cx, ev, in_flight.is_some()) {
-                        Action::None => {}
-                        Action::StartPrompt(text, files, from) => in_flight = Some(self.start_turn(cx, text, files, from)),
-                        Action::SetMode(mode) => self.set_mode(cx, mode).await,
-                        Action::Steer(item_id) => self.send_steer(cx, &item_id).await,
-                        Action::Withdraw { item_id, edit, reply } => {
-                            let r = self.withdraw(cx, &item_id, edit).await;
-                            let _ = reply.send(r);
-                        }
-                        Action::Stop => {
-                            // Let the socket reply drain before the listener is torn down.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            return "stopped".into();
-                        }
+                    let action = self.handle_event(cx, ev, in_flight.is_some());
+                    if let Some(reason) = self.act(cx, action, &mut in_flight).await {
+                        return reason;
                     }
-                    // A prompt the turn couldn't take (it ended meanwhile) waits
-                    // in the queue: start it.
-                    if in_flight.is_none()
-                        && let Some((text, files, from)) = self.take_queued(None)
-                    {
-                        in_flight = Some(self.start_turn(cx, text, files, from));
-                    }
+                    self.start_queued(cx, &mut in_flight);
                 }
-                res = async { in_flight.as_mut().expect("guarded").await }, if in_flight.is_some() => {
+                res = async { in_flight.as_mut().expect("polled only while a prompt is in flight").await }, if in_flight.is_some() => {
                     in_flight = None;
-                    // The agent's last `session/update`s precede its response on the wire but
-                    // reach us through the channel: project them before closing the turn.
-                    tokio::task::yield_now().await;
-                    let mut deferred = Vec::new();
-                    while let Ok(ev) = rx.try_recv() {
-                        match ev {
-                            Event::Update(_) | Event::Permission { .. } | Event::Stderr(_) | Event::Ext { .. } => {
-                                let _ = self.handle_event(cx, ev, true);
-                            }
-                            other => deferred.push(other),
-                        }
-                    }
+                    let deferred = self.drain_turn_events(cx, &mut rx).await;
                     self.end_turn(res);
                     for ev in deferred {
-                        match self.handle_event(cx, ev, in_flight.is_some()) {
-                            Action::None => {}
-                            Action::StartPrompt(text, files, from) => in_flight = Some(self.start_turn(cx, text, files, from)),
-                            Action::SetMode(mode) => self.set_mode(cx, mode).await,
-                            Action::Steer(item_id) => self.send_steer(cx, &item_id).await,
-                            Action::Withdraw { item_id, edit, reply } => {
-                                let r = self.withdraw(cx, &item_id, edit).await;
-                                let _ = reply.send(r);
-                            }
-                            Action::Stop => {
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                return "stopped".into();
-                            }
+                        let action = self.handle_event(cx, ev, in_flight.is_some());
+                        if let Some(reason) = self.act(cx, action, &mut in_flight).await {
+                            return reason;
                         }
                     }
-                    if in_flight.is_none()
-                        && let Some((text, files, from)) = self.take_queued(None)
-                    {
-                        in_flight = Some(self.start_turn(cx, text, files, from));
-                    }
+                    self.start_queued(cx, &mut in_flight);
                 }
                 _ = cx.incoming_closed() => {
                     if in_flight.is_some() {
@@ -744,8 +871,92 @@ impl<W: Write> Host<W> {
         }
     }
 
+    /// Carry out what handling an event asked for.  `Some` with the reason
+    /// when the host is to stop.
+    async fn act(&mut self, cx: &ConnectionTo<Agent>, action: Action, in_flight: &mut Option<PromptFuture>) -> Option<String> {
+        match action {
+            Action::None => {}
+            Action::StartPrompt(text, files, from) => {
+                assert!(in_flight.is_none(), "a prompt starts only between turns");
+                *in_flight = Some(self.start_turn(cx, text, files, from));
+            }
+            Action::SetMode(mode) => self.set_mode(cx, mode).await,
+            Action::Steer(item_id) => self.send_steer(cx, &item_id).await,
+            Action::Withdraw { item_id, edit, reply } => {
+                let r = self.withdraw(cx, &item_id, edit).await;
+                // The client may have given up waiting; the withdrawal stands.
+                let _ = reply.send(r);
+            }
+            Action::Stop => {
+                // Let the socket reply drain before the listener is torn down.
+                tokio::time::sleep(STOP_DRAIN).await;
+                return Some("stopped".into());
+            }
+        }
+        None
+    }
+
+    /// A prompt the turn couldn't take (it ended meanwhile) waits in the
+    /// queue: start it once no turn is running.
+    fn start_queued(&mut self, cx: &ConnectionTo<Agent>, in_flight: &mut Option<PromptFuture>) {
+        if in_flight.is_none()
+            && let Some((text, files, from)) = self.take_queued(None)
+        {
+            *in_flight = Some(self.start_turn(cx, text, files, from));
+        }
+    }
+
+    /// The agent's last `session/update`s precede its response on the wire
+    /// but reach us through the channel: project them before the turn is
+    /// closed.  Commands and the like wait for after; they are returned.
+    async fn drain_turn_events(&mut self, cx: &ConnectionTo<Agent>, rx: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+        tokio::task::yield_now().await;
+        let mut deferred = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::Update(_) | Event::Permission { .. } | Event::Stderr(_) | Event::Ext { .. } => {
+                    let action = self.handle_event(cx, ev, true);
+                    debug_assert!(matches!(action, Action::None), "only commands ask for an action");
+                }
+                other => deferred.push(other),
+            }
+        }
+        deferred
+    }
+
     /// initialize → session/new (or session/load); returns the initial prompt to send.
     async fn setup(&mut self, cx: &ConnectionTo<Agent>) -> Result<Option<(String, Vec<PathBuf>)>> {
+        let can_load = self.initialize(cx).await?;
+        let (sid, modes, raw) = self.open_session(cx, can_load).await?;
+        self.apply_native_mode(cx, &sid, modes.as_ref()).await;
+        let options = self.apply_model(cx, &sid, &raw).await;
+        self.apply_effort(cx, &sid, options.as_ref().or(raw.get("configOptions"))).await;
+        self.line(CYAN, "●", &t!("session {session} · cwd {cwd}", session = sid, cwd = self.cfg.cwd.display()));
+        self.native_session_id = Some(sid.clone());
+        self.store.update_session(
+            &self.signer,
+            &self.cfg.session_id,
+            &SessionUpdate {
+                harness_session_id: Some(sid.to_string()),
+                ..Default::default()
+            },
+        )?;
+        self.store
+            .set_session_socket(&self.cfg.session_id, Some(&self.cfg.socket_path))?;
+        self.set_state(SessionState::Running)?;
+        if self.cfg.initial_prompt.is_none() {
+            self.set_state(SessionState::Idle)?;
+        }
+        Ok(self
+            .cfg
+            .initial_prompt
+            .take()
+            .map(|t| (t, std::mem::take(&mut self.cfg.initial_attachments))))
+    }
+
+    /// `initialize`: what the agent takes in prompts, whether it takes
+    /// prompts into a running turn; whether it can load a session.
+    async fn initialize(&mut self, cx: &ConnectionTo<Agent>) -> Result<bool> {
         let caps = acp::ClientCapabilities::new()
             .fs(acp::FileSystemCapabilities::new()
                 .read_text_file(true)
@@ -774,79 +985,38 @@ impl<W: Write> Host<W> {
             .as_ref()
             .map(|i| format!("{} {}", i.name, i.version))
             .unwrap_or_else(|| self.cfg.harness.to_string());
-        self.line(
-            CYAN,
-            "●",
-            &format!(
-                "initialized: {agent_name} (protocol v{:?})",
-                init.protocol_version
-            ),
-        );
+        let protocol = format!("{:?}", init.protocol_version);
+        self.line(CYAN, "●", &t!("initialized: {agent} (protocol v{protocol})", agent = agent_name, protocol = protocol));
+        Ok(init.agent_capabilities.load_session)
+    }
 
+    /// `session/load` the native session to resume, when there is one and
+    /// the agent can; else `session/new`.  The session id, its modes, and
+    /// the raw reply (the typed one drops fields adapters add).
+    async fn open_session(&mut self, cx: &ConnectionTo<Agent>, can_load: bool) -> Result<(acp::SessionId, Option<acp::SessionModeState>, Value)> {
         let session_meta = self.session_meta();
-        let sid = match (
-            &self.cfg.resume_native_id,
-            init.agent_capabilities.load_session,
-        ) {
+        let mcp_servers: Vec<acp::McpServer> = self.cfg.mcp_servers.iter().map(McpStdio::to_acp).collect();
+        match (self.cfg.resume_native_id.clone(), can_load) {
             (Some(native), true) => {
-                let raw = self
-                    .raw_request(
-                        cx,
-                        "session/load",
-                        acp::LoadSessionRequest::new(native.clone(), self.cfg.cwd.clone())
-                            .mcp_servers(self.cfg.mcp_servers.iter().map(McpStdio::to_acp).collect())
-                            .meta(session_meta.clone()),
-                    )
-                    .await?;
+                let params = acp::LoadSessionRequest::new(native.clone(), self.cfg.cwd.clone())
+                    .mcp_servers(mcp_servers)
+                    .meta(session_meta);
+                let raw = self.raw_request(cx, "session/load", params).await?;
                 let resp: acp::LoadSessionResponse = serde_json::from_value(raw.clone()).context("session/load reply")?;
-                (acp::SessionId::new(native.clone()), resp.modes, raw)
+                Ok((acp::SessionId::new(native), resp.modes, raw))
             }
             (resume, _) => {
                 if resume.is_some() {
-                    self.dim("agent cannot load sessions; starting a new one");
+                    self.dim(t!("agent cannot load sessions; starting a new one"));
                 }
-                let raw = self
-                    .raw_request(
-                        cx,
-                        "session/new",
-                        acp::NewSessionRequest::new(self.cfg.cwd.clone())
-                            .mcp_servers(self.cfg.mcp_servers.iter().map(McpStdio::to_acp).collect())
-                            .meta(session_meta.clone()),
-                    )
-                    .await?;
+                let params = acp::NewSessionRequest::new(self.cfg.cwd.clone())
+                    .mcp_servers(mcp_servers)
+                    .meta(session_meta);
+                let raw = self.raw_request(cx, "session/new", params).await?;
                 let resp: acp::NewSessionResponse = serde_json::from_value(raw.clone()).context("session/new reply")?;
-                (resp.session_id, resp.modes, raw)
+                Ok((resp.session_id, resp.modes, raw))
             }
-        };
-        let (sid, modes, raw) = sid;
-        self.apply_native_mode(cx, &sid, modes.as_ref()).await;
-        let options = self.apply_model(cx, &sid, &raw).await;
-        self.apply_effort(cx, &sid, options.as_ref().or(raw.get("configOptions"))).await;
-        self.line(
-            CYAN,
-            "●",
-            &format!("session {sid} · cwd {}", self.cfg.cwd.display()),
-        );
-        self.native_session_id = Some(sid.clone());
-        self.store.update_session(
-            &self.signer,
-            &self.cfg.session_id,
-            &SessionUpdate {
-                harness_session_id: Some(sid.to_string()),
-                ..Default::default()
-            },
-        )?;
-        self.store
-            .set_session_socket(&self.cfg.session_id, Some(&self.cfg.socket_path))?;
-        self.set_state(SessionState::Running)?;
-        if self.cfg.initial_prompt.is_none() {
-            self.set_state(SessionState::Idle)?;
         }
-        Ok(self
-            .cfg
-            .initial_prompt
-            .take()
-            .map(|t| (t, std::mem::take(&mut self.cfg.initial_attachments))))
     }
 
     /// A request by method name, returning the raw reply: the typed schema
@@ -879,7 +1049,7 @@ impl<W: Write> Host<W> {
         // An unknown name goes through as given: the harness may accept full ids it doesn't list.
         let id = resolve_model(&want, &available).unwrap_or_else(|| want.clone());
         if id == current {
-            self.line(CYAN, "●", &format!("model {id}"));
+            self.line(CYAN, "●", &t!("model {model}", model = id));
             return None;
         }
         let (method, params) = match selector {
@@ -888,16 +1058,17 @@ impl<W: Write> Host<W> {
         };
         match self.raw_request(cx, method, params).await {
             Ok(reply) => {
-                self.line(CYAN, "●", &format!("model {id}"));
+                self.line(CYAN, "●", &t!("model {model}", model = id));
                 reply.get("configOptions").filter(|o| o.as_array().is_some_and(|a| !a.is_empty())).cloned()
             }
             Err(e) => {
                 let listed: Vec<&str> = available.iter().filter_map(|m| m.get("modelId")?.as_str()).collect();
-                let msg = format!(
-                    "could not switch the agent to model {want} ({e}); it runs {}{}",
-                    if current.is_empty() { "its default" } else { current },
-                    if listed.is_empty() { String::new() } else { format!(" · available: {}", listed.join(", ")) }
-                );
+                let msg = if current.is_empty() {
+                    t!("could not switch the agent to model {model} ({error}); it runs its default", model = want, error = e)
+                } else {
+                    t!("could not switch the agent to model {model} ({error}); it runs {current}", model = want, error = e, current = current)
+                };
+                let msg = if listed.is_empty() { msg } else { t!("{message} · available: {models}", message = msg, models = listed.join(", ")) };
                 self.warn(&msg);
                 None
             }
@@ -908,8 +1079,13 @@ impl<W: Write> Host<W> {
     /// the host's log and as an item on the thread.
     fn warn(&mut self, msg: &str) {
         self.line(YELLOW, "!", msg);
+        self.record_error(msg);
+    }
+
+    /// An `Error` item on the thread, so viewers see what went wrong.
+    fn record_error(&mut self, msg: &str) {
         if let Err(e) = self.push(ItemKind::Error, Some(ItemStatus::Failed), None, json!({ "message": msg })) {
-            self.line(RED, "✖", &format!("store: {e}"));
+            self.store_failed(&e);
         }
     }
 
@@ -938,23 +1114,35 @@ impl<W: Write> Host<W> {
         let harness = self.cfg.harness.label().to_string();
         let options = options.and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
         let Some(selector) = effort_selector(options) else {
-            self.warn(&format!("could not set effort {effort}: {harness} offers no effort option; {}", effort_left_at(None)));
+            self.warn(&t!("could not set effort {effort}: {harness} offers no effort option; its effort is unchanged", effort = effort, harness = harness));
             return;
         };
         let offered = select_values(selector.get("options").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]));
         let Some((value, _)) = offered.iter().find(|(value, name)| same_level(value, effort) || same_level(name, effort)) else {
-            let listed: Vec<&str> = offered.iter().map(|(v, _)| v.as_str()).collect();
-            self.warn(&format!("could not set effort {effort}: {harness} offers {}; {}", listed.join(", "), effort_left_at(Some(selector))));
+            let levels = offered.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>().join(", ");
+            self.warn(&match effort_left_at(selector) {
+                Some(current) => t!(
+                    "could not set effort {effort}: {harness} offers {levels}; it stays at {current}",
+                    effort = effort, harness = harness, levels = levels, current = current,
+                ),
+                None => t!("could not set effort {effort}: {harness} offers {levels}; its effort is unchanged", effort = effort, harness = harness, levels = levels),
+            });
             return;
         };
         if selector.get("currentValue").and_then(Value::as_str) == Some(value) {
-            self.line(CYAN, "●", &format!("effort {value}"));
+            self.line(CYAN, "●", &t!("effort {level}", level = value));
             return;
         }
         let params = json!({ "sessionId": sid.to_string(), "configId": selector["id"], "value": value });
         match self.raw_request(cx, "session/set_config_option", params).await {
-            Ok(_) => self.line(CYAN, "●", &format!("effort {value}")),
-            Err(e) => self.warn(&format!("could not set effort {effort} on {harness} ({e}); {}", effort_left_at(Some(selector)))),
+            Ok(_) => self.line(CYAN, "●", &t!("effort {level}", level = value)),
+            Err(e) => self.warn(&match effort_left_at(selector) {
+                Some(current) => t!(
+                    "could not set effort {effort} on {harness} ({error}); it stays at {current}",
+                    effort = effort, harness = harness, error = e, current = current,
+                ),
+                None => t!("could not set effort {effort} on {harness} ({error}); its effort is unchanged", effort = effort, harness = harness, error = e),
+            }),
         }
     }
 
@@ -975,7 +1163,7 @@ impl<W: Write> Host<W> {
             return;
         }
         if !modes.available_modes.iter().any(|m| m.id.to_string() == want) {
-            self.dim(&format!("agent has no {want} mode; staying in {}", modes.current_mode_id));
+            self.dim(&t!("agent has no {mode} mode; staying in {current}", mode = want, current = modes.current_mode_id));
             return;
         }
         let res = cx
@@ -984,20 +1172,17 @@ impl<W: Write> Host<W> {
             .await;
         match res {
             Ok(_) => {
-                self.line(CYAN, "●", &format!("mode {want} ({})", self.cfg.runtime_mode));
+                self.line(CYAN, "●", &t!("mode {mode} ({runtime_mode})", mode = want, runtime_mode = self.cfg.runtime_mode));
                 if let Some(m) = self.native_modes.as_mut() {
                     m.current_mode_id = acp::SessionModeId::new(want.to_string());
                 }
             }
             Err(e) => {
-                let msg = format!(
-                    "could not switch the agent to {want} for {} ({e}); it stays in {}, so background sub-agents may be refused",
-                    self.cfg.runtime_mode, modes.current_mode_id
+                let msg = t!(
+                    "could not switch the agent to {mode} for {runtime_mode} ({error}); it stays in {current}, so background sub-agents may be refused",
+                    mode = want, runtime_mode = self.cfg.runtime_mode, error = e, current = modes.current_mode_id,
                 );
-                self.line(YELLOW, "!", &msg);
-                if let Err(e) = self.push(ItemKind::Error, Some(ItemStatus::Failed), None, json!({ "message": msg })) {
-                    self.line(RED, "✖", &format!("store: {e}"));
-                }
+                self.warn(&msg);
             }
         }
     }
@@ -1015,9 +1200,9 @@ impl<W: Write> Host<W> {
             &self.cfg.session_id,
             &SessionUpdate { runtime_mode: Some(mode), ..Default::default() },
         ) {
-            self.line(RED, "✖", &format!("store: {e}"));
+            self.store_failed(&e);
         }
-        self.line(CYAN, "●", &format!("runtime mode → {mode}"));
+        self.line(CYAN, "●", &t!("runtime mode → {mode}", mode = mode));
         if let Some(sid) = self.native_session_id.clone() {
             let modes = self.native_modes.clone();
             self.apply_native_mode(cx, &sid, modes.as_ref()).await;
@@ -1028,13 +1213,13 @@ impl<W: Write> Host<W> {
         match ev {
             Event::Update(n) => {
                 if let Err(e) = self.on_update(n.update) {
-                    self.line(RED, "✖", &format!("store: {e}"));
+                    self.store_failed(&e);
                 }
                 Action::None
             }
             Event::Permission { req, reply } => {
                 if let Err(e) = self.on_permission(req, reply) {
-                    self.line(RED, "✖", &format!("permission: {e}"));
+                    self.line(RED, "✖", &t!("permission: {error}", error = e));
                 }
                 Action::None
             }
@@ -1048,6 +1233,7 @@ impl<W: Write> Host<W> {
             }
             Event::Command { cmd, reply } => {
                 let (r, action) = self.on_command(cx, cmd, in_turn);
+                // The client may have hung up; what the command did stands.
                 let _ = reply.send(r);
                 action
             }
@@ -1071,131 +1257,22 @@ impl<W: Write> Host<W> {
         in_turn: bool,
     ) -> (Reply, Action) {
         match cmd {
-            Command::Prompt {
-                text,
-                attachments,
-                steer,
-                from,
-            } => {
-                if text.trim().is_empty() && attachments.is_empty() {
-                    return (
-                        Reply::Error {
-                            message: "empty prompt".into(),
-                        },
-                        Action::None,
-                    );
-                }
-                if !in_turn {
-                    return (Reply::Ok, Action::StartPrompt(text, attachments, from));
-                }
-                // The owner's message goes into the running turn. Another
-                // agent's waits for its own turn, so its answer goes back to it.
-                if !steer && self.can_steer && from.is_none() {
-                    return match self.record_steer(text, attachments) {
-                        Ok(item_id) => (Reply::Steering { item_id: item_id.clone() }, Action::Steer(item_id)),
-                        Err(e) => (Reply::Error { message: format!("store: {e}") }, Action::None),
-                    };
-                }
-                match self.enqueue(text, attachments, steer, from) {
-                    Ok(item_id) => {
-                        if steer && let Err(e) = self.cancel_turn(cx) {
-                            return (Reply::Error { message: e }, Action::None);
-                        }
-                        (Reply::Queued { item_id }, Action::None)
-                    }
-                    Err(e) => (
-                        Reply::Error {
-                            message: format!("queue: {e}"),
-                        },
-                        Action::None,
-                    ),
-                }
-            }
-            Command::Note { text, from } => {
-                if text.trim().is_empty() {
-                    return (Reply::Error { message: "empty note".into() }, Action::None);
-                }
-                let content = json!({ "text": text, "from": from.pubkey, "fyi": true });
-                match self.push(ItemKind::UserMessage, Some(ItemStatus::Completed), None, content) {
-                    Ok(_) => {
-                        self.line(DIM, "✎", &format!("note from {}  {}", from.name, head(&text, 100)));
-                        (Reply::Ok, Action::None)
-                    }
-                    Err(e) => (Reply::Error { message: format!("store: {e}") }, Action::None),
-                }
-            }
-            Command::Steer { item_id } => {
-                let Some(pos) = self.queue.iter().position(|q| q.item_id == item_id) else {
-                    return (
-                        Reply::Error {
-                            message: "that message is no longer queued".into(),
-                        },
-                        Action::None,
-                    );
-                };
-                if !in_turn {
-                    let (text, files, from) = self.take_queued(Some(pos)).expect("position checked");
-                    return (Reply::Ok, Action::StartPrompt(text, files, from));
-                }
-                // Into the running turn, rather than cancelling it.
-                if self.can_steer && self.queue[pos].from.is_none() {
-                    let q = self.queue.remove(pos).expect("position checked");
-                    self.patch_item(&q.item_id, json!({ "steering": true }));
-                    let id = q.item_id.clone();
-                    self.steering.push_back(q);
-                    return (Reply::Steering { item_id: id.clone() }, Action::Steer(id));
-                }
-                let q = self.queue.remove(pos).expect("position checked");
-                self.queue.push_front(q);
-                match self.cancel_turn(cx) {
-                    Ok(()) => (Reply::Ok, Action::None),
-                    Err(e) => (Reply::Error { message: e }, Action::None),
-                }
-            }
-            Command::Dequeue { item_id } => {
-                let Some(pos) = self.queue.iter().position(|q| q.item_id == item_id) else {
-                    return (
-                        Reply::Error {
-                            message: "that message is no longer queued".into(),
-                        },
-                        Action::None,
-                    );
-                };
-                self.queue.remove(pos);
-                if let Err(e) = self.store.delete_item(&item_id) {
-                    self.line(RED, "✖", &format!("store: {e}"));
-                }
-                self.dim(&format!("dequeued {item_id}"));
-                (Reply::Ok, Action::None)
-            }
-            Command::Edit { item_id, text } => {
-                if text.trim().is_empty() {
-                    return (Reply::Error { message: "empty message: remove it instead".into() }, Action::None);
-                }
-                let Some(q) = self.queue.iter_mut().find(|q| q.item_id == item_id) else {
-                    return (Reply::Error { message: "the agent has read that message already".into() }, Action::None);
-                };
-                q.text = text.clone();
-                self.patch_item(&item_id, json!({ "text": text }));
-                self.dim(&format!("edited {item_id}"));
-                (Reply::Ok, Action::None)
-            }
+            Command::Prompt { text, attachments, steer, from } => self.on_prompt(cx, text, attachments, steer, from, in_turn),
+            Command::Note { text, from } => (self.on_note(&text, &from), Action::None),
+            Command::Steer { item_id } => self.on_steer(cx, &item_id, in_turn),
+            Command::Dequeue { item_id } => (self.on_dequeue(&item_id), Action::None),
+            Command::Edit { item_id, text } => (self.on_edit(&item_id, text), Action::None),
             Command::SetMode { mode } => (Reply::Ok, Action::SetMode(mode)),
             Command::Cancel => {
                 self.cancel_pending("cancelled");
                 if in_turn && let Err(e) = self.cancel_turn(cx) {
-                    return (Reply::Error { message: e }, Action::None);
+                    return (error_reply(e), Action::None);
                 }
                 (Reply::Ok, Action::None)
             }
             Command::Answer { item_id, option_id } => match self.answer(&item_id, &option_id) {
                 Ok(()) => (Reply::Ok, Action::None),
-                Err(e) => (
-                    Reply::Error {
-                        message: e.to_string(),
-                    },
-                    Action::None,
-                ),
+                Err(e) => (error_reply(e.to_string()), Action::None),
             },
             Command::Status => (
                 Reply::Status {
@@ -1210,6 +1287,109 @@ impl<W: Write> Host<W> {
         }
     }
 
+    /// A prompt: it starts a turn, goes into the running one, or waits.
+    fn on_prompt(
+        &mut self,
+        cx: &ConnectionTo<Agent>,
+        text: String,
+        attachments: Vec<PathBuf>,
+        steer: bool,
+        from: Option<Sender>,
+        in_turn: bool,
+    ) -> (Reply, Action) {
+        if text.trim().is_empty() && attachments.is_empty() {
+            return (error_reply("empty prompt"), Action::None);
+        }
+        if !in_turn {
+            return (Reply::Ok, Action::StartPrompt(text, attachments, from));
+        }
+        // The owner's message goes into the running turn. Another
+        // agent's waits for its own turn, so its answer goes back to it.
+        if !steer && self.can_steer && from.is_none() {
+            return match self.record_steer(text, attachments) {
+                Ok(item_id) => (Reply::Steering { item_id: item_id.clone() }, Action::Steer(item_id)),
+                Err(e) => (error_reply(format!("store: {e}")), Action::None),
+            };
+        }
+        match self.enqueue(text, attachments, steer, from) {
+            Ok(item_id) => {
+                if steer && let Err(e) = self.cancel_turn(cx) {
+                    return (error_reply(e), Action::None);
+                }
+                (Reply::Queued { item_id }, Action::None)
+            }
+            Err(e) => (error_reply(format!("queue: {e}")), Action::None),
+        }
+    }
+
+    /// A note from another agent: on the thread, no turn.
+    fn on_note(&mut self, text: &str, from: &Sender) -> Reply {
+        if text.trim().is_empty() {
+            return error_reply("empty note");
+        }
+        let content = json!({ "text": text, "from": from.pubkey, "fyi": true });
+        match self.push(ItemKind::UserMessage, Some(ItemStatus::Completed), None, content) {
+            Ok(_) => {
+                self.line(DIM, "✎", &t!("note from {name}  {text}", name = from.name, text = head(text, 100)));
+                Reply::Ok
+            }
+            Err(e) => error_reply(format!("store: {e}")),
+        }
+    }
+
+    /// Send a queued prompt now: it starts a turn, goes into the running
+    /// one, or goes first and cancels it.
+    fn on_steer(&mut self, cx: &ConnectionTo<Agent>, item_id: &str, in_turn: bool) -> (Reply, Action) {
+        let Some(pos) = self.queue.iter().position(|q| q.item_id == item_id) else {
+            return (error_reply("that message is no longer queued"), Action::None);
+        };
+        if !in_turn {
+            let (text, files, from) = self.take_queued(Some(pos)).expect("position checked");
+            return (Reply::Ok, Action::StartPrompt(text, files, from));
+        }
+        // Into the running turn, rather than cancelling it.
+        if self.can_steer && self.queue[pos].from.is_none() {
+            let q = self.queue.remove(pos).expect("position checked");
+            self.patch_item(&q.item_id, json!({ "steering": true }));
+            let id = q.item_id.clone();
+            self.steering.push_back(q);
+            return (Reply::Steering { item_id: id.clone() }, Action::Steer(id));
+        }
+        let q = self.queue.remove(pos).expect("position checked");
+        self.queue.push_front(q);
+        match self.cancel_turn(cx) {
+            Ok(()) => (Reply::Ok, Action::None),
+            Err(e) => (error_reply(e), Action::None),
+        }
+    }
+
+    /// Withdraw a queued prompt.
+    fn on_dequeue(&mut self, item_id: &str) -> Reply {
+        let Some(pos) = self.queue.iter().position(|q| q.item_id == item_id) else {
+            return error_reply("that message is no longer queued");
+        };
+        self.queue.remove(pos);
+        if let Err(e) = self.store.delete_item(item_id) {
+            self.store_failed(&e);
+        }
+        self.dim(&t!("dequeued {item}", item = item_id));
+        Reply::Ok
+    }
+
+    /// Change the text of a queued prompt.
+    fn on_edit(&mut self, item_id: &str, text: String) -> Reply {
+        if text.trim().is_empty() {
+            return error_reply("empty message: remove it instead");
+        }
+        let Some(q) = self.queue.iter_mut().find(|q| q.item_id == item_id) else {
+            return error_reply("the agent has read that message already");
+        };
+        q.text = text.clone();
+        self.patch_item(item_id, json!({ "text": text }));
+        self.dim(&t!("edited {item}", item = item_id));
+        Reply::Ok
+    }
+
     // --- turns ---
 
     /// `session/cancel` the running turn (pending permissions are rejected).
@@ -1220,13 +1400,14 @@ impl<W: Write> Host<W> {
         };
         cx.send_notification(acp::CancelNotification::new(sid))
             .map_err(|e| format!("session/cancel: {e}"))?;
-        self.line(YELLOW, "■", &format!("cancelling turn {}", self.turn));
+        self.line(YELLOW, "■", &t!("cancelling turn {turn}", turn = self.turn));
         Ok(())
     }
 
     /// Persist a prompt sent mid-turn as a pending `UserMessage` and queue it
     /// (first when steering).  Returns the item id.
     fn enqueue(&mut self, text: String, files: Vec<PathBuf>, steer: bool, from: Option<Sender>) -> Result<String> {
+        self.ensure_room_to_queue()?;
         let paths = attach::attachment_paths(&files);
         let mut content = json!({ "text": text, "attachments": paths, "queued": true });
         if let Some(f) = &from {
@@ -1239,8 +1420,8 @@ impl<W: Write> Host<W> {
             files,
             from,
         };
-        let verb = if steer { "steering" } else { "queued" };
-        self.line(BLUE, "…", &format!("{verb}  {DIM}{}{RESET}", head(&q.text, 100)));
+        let text = format!("{DIM}{}{RESET}", head(&q.text, 100));
+        self.line(BLUE, "…", &if steer { t!("steering  {text}", text = text) } else { t!("queued  {text}", text = text) });
         if steer {
             self.queue.push_front(q);
         } else {
@@ -1252,23 +1433,31 @@ impl<W: Write> Host<W> {
     /// Record a prompt sent into the running turn, as a pending `UserMessage`
     /// (it shows as not read yet until the agent takes it in). Its item id.
     fn record_steer(&mut self, text: String, files: Vec<PathBuf>) -> Result<String> {
+        self.ensure_room_to_queue()?;
         let paths = attach::attachment_paths(&files);
         let content = json!({ "text": text, "attachments": paths, "queued": true, "steering": true });
         let item = self.push(ItemKind::UserMessage, Some(ItemStatus::Pending), None, content)?;
-        self.line(BLUE, "↳", &format!("into the turn  {DIM}{}{RESET}", head(&text, 100)));
+        self.line(BLUE, "↳", &t!("into the turn  {text}", text = format!("{DIM}{}{RESET}", head(&text, 100))));
         self.steering.push_back(Queued { item_id: item.id.clone(), text, files, from: None });
         Ok(item.id)
+    }
+
+    /// Refuse another waiting prompt past [`QUEUED_MAX`].
+    fn ensure_room_to_queue(&self) -> Result<()> {
+        let waiting = self.queue.len() + self.steering.len();
+        // Every path that adds a waiting prompt comes through here, so the
+        // limit holds; a prompt going back from `steering` only moves.
+        debug_assert!(waiting <= QUEUED_MAX);
+        anyhow::ensure!(waiting < QUEUED_MAX, "{waiting} messages are already waiting; send this once the agent has read some");
+        Ok(())
     }
 
     /// Hand a prompt in `steering` to the adapter for the running turn. If it
     /// can't take it (the turn just ended), it waits in the queue instead.
     async fn send_steer(&mut self, cx: &ConnectionTo<Agent>, item_id: &str) {
         let Some(q) = self.steering.iter().find(|q| q.item_id == item_id) else { return };
-        let mut warnings = Vec::new();
-        let blocks = attach::build_prompt_blocks(&q.text, &q.files, self.prompt_caps, &mut |w| warnings.push(w));
-        for w in warnings {
-            self.line(YELLOW, "!", &w);
-        }
+        let (text, files) = (q.text.clone(), q.files.clone());
+        let blocks = self.prompt_blocks(&text, &files);
         let Some(sid) = self.native_session_id.clone() else { return };
         let params = json!({ "sessionId": sid.to_string(), "messageId": item_id, "prompt": blocks });
         let accepted = match self.raw_request(cx, "_axel/steer", params).await {
@@ -1289,6 +1478,7 @@ impl<W: Write> Host<W> {
         let Some(pos) = self.steering.iter().position(|q| q.item_id == item_id) else { return };
         let q = self.steering.remove(pos).expect("position checked");
         self.patch_item(item_id, json!({ "steering": null }));
+        debug_assert!(!self.queue.iter().chain(&self.steering).any(|w| w.item_id == item_id), "a prompt waits in one place only");
         if front {
             self.queue.push_front(q);
         } else {
@@ -1321,15 +1511,15 @@ impl<W: Write> Host<W> {
                     q.text = text.clone();
                 }
                 self.patch_item(item_id, json!({ "text": text }));
-                self.dim(&format!("edited {item_id}"));
+                self.dim(&t!("edited {item}", item = item_id));
                 self.send_steer(cx, item_id).await;
             }
             None => {
                 self.steering.retain(|q| q.item_id != item_id);
                 if let Err(e) = self.store.delete_item(item_id) {
-                    self.line(RED, "✖", &format!("store: {e}"));
+                    self.store_failed(&e);
                 }
-                self.dim(&format!("withdrew {item_id}"));
+                self.dim(&t!("withdrew {item}", item = item_id));
             }
         }
         Reply::Ok
@@ -1345,9 +1535,9 @@ impl<W: Write> Host<W> {
                 let Some(pos) = self.steering.iter().position(|q| q.item_id == id) else { return };
                 let q = self.steering.remove(pos).expect("position checked");
                 if let Err(e) = self.store.update_item(id, Some(ItemStatus::Completed), Some(json!({ "queued": null, "steering": null }))) {
-                    self.line(RED, "✖", &format!("store: {e}"));
+                    self.store_failed(&e);
                 }
-                self.line(BLUE, "↳", &format!("read  {DIM}{}{RESET}", head(&q.text, 100)));
+                self.line(BLUE, "↳", &t!("read  {text}", text = format!("{DIM}{}{RESET}", head(&q.text, 100))));
             }
             // Spend so far in a running turn: tokens now, the turn counted
             // with its reply.
@@ -1360,7 +1550,7 @@ impl<W: Write> Host<W> {
                 self.turn_progress_cost += delta.cost_usd_est;
                 self.turn_progress = true;
                 if let Err(e) = self.store.add_usage(&self.signer, &self.cfg.session_id, &delta, None) {
-                    self.line(RED, "✖", &format!("usage: {e}"));
+                    self.line(RED, "✖", &t!("usage: {error}", error = e));
                 } else {
                     self.session_cost += delta.cost_usd_est;
                 }
@@ -1368,7 +1558,7 @@ impl<W: Write> Host<W> {
             "_axel/limits" => {
                 for l in crate::usage::limits_from_params(params) {
                     if let Err(e) = self.store.set_plan_limit(&self.cfg.harness, l.window, l.used_pct, l.resets_at) {
-                        self.line(RED, "✖", &format!("store: {e}"));
+                        self.store_failed(&e);
                     }
                 }
             }
@@ -1386,7 +1576,7 @@ impl<W: Write> Host<W> {
     /// Merge `patch` into an item's content.
     fn patch_item(&mut self, item_id: &str, patch: Value) {
         if let Err(e) = self.store.update_item(item_id, None, Some(patch)) {
-            self.line(RED, "✖", &format!("store: {e}"));
+            self.store_failed(&e);
         }
     }
 
@@ -1396,7 +1586,7 @@ impl<W: Write> Host<W> {
     fn take_queued(&mut self, pos: Option<usize>) -> Option<(String, Vec<PathBuf>, Option<Sender>)> {
         let q = self.queue.remove(pos.unwrap_or(0))?;
         if let Err(e) = self.store.delete_item(&q.item_id) {
-            self.line(RED, "✖", &format!("store: {e}"));
+            self.store_failed(&e);
         }
         Some((q.text, q.files, q.from))
     }
@@ -1415,7 +1605,7 @@ impl<W: Write> Host<W> {
         self.finalize_text();
         let last = self
             .store
-            .items(&self.cfg.session_id, 0, 100_000)
+            .items(&self.cfg.session_id, 0, SESSION_ITEMS_MAX)
             .unwrap_or_default()
             .into_iter()
             .rev()
@@ -1435,9 +1625,12 @@ impl<W: Write> Host<W> {
             .stdin(std::process::Stdio::null())
             .output()
         {
-            Ok(o) if o.status.success() => self.line(DIM, "↩", &format!("answer returned to {}", from.name)),
-            Ok(o) => self.line(RED, "✖", &format!("returning the answer to {}: {}", from.name, String::from_utf8_lossy(&o.stderr).trim())),
-            Err(e) => self.line(RED, "✖", &format!("returning the answer to {}: {e}", from.name)),
+            Ok(o) if o.status.success() => self.line(DIM, "↩", &t!("answer returned to {name}", name = from.name)),
+            Ok(o) => {
+                let error = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                self.line(RED, "✖", &t!("returning the answer to {name}: {error}", name = from.name, error = error));
+            }
+            Err(e) => self.line(RED, "✖", &t!("returning the answer to {name}: {error}", name = from.name, error = e)),
         }
     }
 
@@ -1515,7 +1708,7 @@ impl<W: Write> Host<W> {
             content["from"] = json!(f.pubkey);
         }
         if let Err(e) = self.push(ItemKind::UserMessage, Some(ItemStatus::Completed), None, content) {
-            self.line(RED, "✖", &format!("store: {e}"));
+            self.store_failed(&e);
         }
         // The thread shows the message as written; the agent also reads who
         // wrote it, and first what it missed on the thread.
@@ -1523,50 +1716,20 @@ impl<W: Write> Host<W> {
         let catch_up = self.catch_up();
         self.seen_through = Some(chrono::Utc::now().timestamp_millis());
         let wire_text = crate::catchup::prepend(catch_up.as_deref(), &framed);
-        self.turn_assistant_text.clear();
-        self.turn_tool_calls = 0;
-        self.turn_files_edited = 0;
-        self.turn_authored.clear();
-        self.turn_progress_cost = 0.0;
-        self.turn_progress = false;
-        self.cur_text = None;
-        if let Err(e) = self.set_state(SessionState::Running) {
-            self.line(RED, "✖", &format!("store: {e}"));
-        }
-        let _ = self.store.record_status(
-            &self.signer,
-            &self.cfg.session_id,
-            &StatusReport {
-                state: StatusState::Working,
-                title: Some(format!("turn {}", self.turn)),
-                msg: Some(head(&text, 120)),
-                ..Default::default()
-            },
-        );
-        self.program_status(axel_rex::osc::State::Working, None, &head(&text, 200));
+        self.reset_turn_tallies();
+        self.announce_turn_start(&text);
         // Still before session/prompt, so the agent's first edit cannot enter
         // the before snapshot. Only message visibility moves ahead of this I/O.
         self.turn_before = self.checkpoint(checkpoint::Which::Before);
-        let turn = self.turn;
-        let files_note = if files.is_empty() {
-            String::new()
+        let shown = format!("{DIM}{}{RESET}", head(&text, 100));
+        let line = if files.is_empty() {
+            t!("prompt {turn}  {text}", turn = self.turn, text = shown)
         } else {
-            format!(" {DIM}+{} file(s){RESET}", files.len())
+            let attached = format!("{DIM}{}{RESET}", t!("+{count} file(s)", count = files.len()));
+            t!("prompt {turn}  {text} {files}", turn = self.turn, text = shown, files = attached)
         };
-        self.line(
-            BOLD,
-            "▶",
-            &format!(
-                "prompt {turn}  {DIM}{}{RESET}{files_note}",
-                head(&text, 100)
-            ),
-        );
-        let mut warnings = Vec::new();
-        let blocks =
-            attach::build_prompt_blocks(&wire_text, &files, self.prompt_caps, &mut |w| warnings.push(w));
-        for w in warnings {
-            self.line(YELLOW, "!", &w);
-        }
+        self.line(BOLD, "▶", &line);
+        let blocks = self.prompt_blocks(&wire_text, &files);
         let sid = self
             .native_session_id
             .clone()
@@ -1575,6 +1738,49 @@ impl<W: Write> Host<W> {
             .send_request(acp::PromptRequest::new(sid, blocks))
             .block_task();
         Box::pin(fut)
+    }
+
+    /// What a turn counts starts at zero.
+    fn reset_turn_tallies(&mut self) {
+        self.turn_assistant_text.clear();
+        self.turn_tool_calls = 0;
+        self.turn_files_edited = 0;
+        self.turn_authored.clear();
+        self.turn_progress_cost = 0.0;
+        self.turn_progress = false;
+        self.open_text = None;
+    }
+
+    /// The session is working on `text`: its state, its status, and the
+    /// pane's program status.
+    fn announce_turn_start(&mut self, text: &str) {
+        if let Err(e) = self.set_state(SessionState::Running) {
+            self.store_failed(&e);
+        }
+        if let Err(e) = self.store.record_status(
+            &self.signer,
+            &self.cfg.session_id,
+            &StatusReport {
+                state: StatusState::Working,
+                title: Some(format!("turn {}", self.turn)),
+                msg: Some(head(text, 120)),
+                ..Default::default()
+            },
+        ) {
+            self.line(RED, "✖", &t!("status: {error}", error = e));
+        }
+        self.program_status(axel_rex::osc::State::Working, None, &head(text, 200));
+    }
+
+    /// A prompt's content blocks, with a warning in the pane for each
+    /// attachment that couldn't go in as it is.
+    fn prompt_blocks(&mut self, text: &str, files: &[PathBuf]) -> Vec<acp::ContentBlock> {
+        let mut warnings = Vec::new();
+        let blocks = attach::build_prompt_blocks(text, files, self.prompt_caps, &mut |w| warnings.push(w));
+        for w in warnings {
+            self.line(YELLOW, "!", &w);
+        }
+        blocks
     }
 
     /// What the turn spent, when the reply says it in Axel's terms (our own
@@ -1588,7 +1794,7 @@ impl<W: Write> Host<W> {
             if progress
                 && let Err(e) = self.store.add_usage(&self.signer, &self.cfg.session_id, &axel_store::UsageDelta { turns: 1, ..Default::default() }, None)
             {
-                self.line(RED, "✖", &format!("usage: {e}"));
+                self.line(RED, "✖", &t!("usage: {error}", error = e));
             }
             return;
         };
@@ -1599,48 +1805,84 @@ impl<W: Write> Host<W> {
             delta.cost_usd_est = (delta.cost_usd_est - progress_cost).max(0.0);
         }
         if let Err(e) = self.store.add_usage(&self.signer, &self.cfg.session_id, &delta, None) {
-            self.line(RED, "✖", &format!("usage: {e}"));
+            self.line(RED, "✖", &t!("usage: {error}", error = e));
         } else {
             self.session_cost += delta.cost_usd_est;
         }
     }
 
     fn end_turn(&mut self, res: Result<acp::PromptResponse, acp::Error>) {
-        self.finalize_text();
-        self.cancel_pending("turn ended");
-        self.close_open_tool_calls();
-        // Sent into the turn and never taken in: they wait for the next one.
-        let unread: Vec<String> = self.steering.iter().map(|q| q.item_id.clone()).collect();
-        for id in unread.iter().rev() {
-            self.unsteer_to_queue(id, true);
-        }
-        let duration_ms = self.turn_started.elapsed().as_millis() as i64;
-        let (stop_reason, status) = match &res {
-            Ok(resp) => {
-                let s = enum_str(&resp.stop_reason);
-                let st = if s == "cancelled" {
-                    ItemStatus::Cancelled
-                } else {
-                    ItemStatus::Completed
-                };
-                (s, st)
-            }
+        self.close_turn_items();
+        let duration_ms = i64::try_from(self.turn_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let (outcome, stop_reason) = match &res {
+            Ok(resp) => (TurnOutcome::of(resp.stop_reason), enum_str(&resp.stop_reason)),
             Err(e) => {
-                if let Err(err) = self.push(
-                    ItemKind::Error,
-                    Some(ItemStatus::Failed),
-                    None,
-                    json!({ "message": e.to_string() }),
-                ) {
-                    self.line(RED, "✖", &format!("store: {err}"));
-                }
-                ("error".to_string(), ItemStatus::Failed)
+                self.record_error(&e.to_string());
+                (TurnOutcome::Failed, "error".to_string())
             }
         };
         if let Ok(resp) = &res {
             self.record_usage(resp);
         }
         let changes = self.turn_changes();
+        let changed = changes_note(changes.as_ref());
+        self.record_turn_end(outcome, &stop_reason, duration_ms, changes);
+        if let Err(e) = self.set_state(SessionState::Idle) {
+            self.store_failed(&e);
+        }
+        let head: String = self.turn_assistant_text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect();
+        self.announce_turn_end(outcome, &stop_reason, &head);
+        // Another agent's message started this turn: its answer goes back.
+        if outcome == TurnOutcome::Finished {
+            self.return_answer();
+        }
+        // A finished turn is a result to look at (done); a cancelled one is at
+        // rest (idle); a failed one stopped (error).
+        let (osc_state, osc_msg) = match outcome {
+            TurnOutcome::Failed => (axel_rex::osc::State::Error, t!("the turn failed").to_string()),
+            TurnOutcome::Cancelled => (axel_rex::osc::State::Idle, String::new()),
+            TurnOutcome::Finished | TurnOutcome::StoppedShort => (axel_rex::osc::State::Done, head),
+        };
+        self.program_status(osc_state, None, &osc_msg);
+        let seconds = format!("{:.1}", duration_ms as f64 / 1000.0);
+        let (tools, turn) = (self.turn_tool_calls, self.turn);
+        match (outcome, &res) {
+            (_, Err(e)) => self.line(RED, "✖", &t!("turn {turn} failed: {error}", turn = turn, error = e)),
+            (TurnOutcome::Cancelled, Ok(_)) => {
+                let line = t!("turn {turn} cancelled · {tools} tools · {seconds}s{changes}", turn = turn, tools = tools, seconds = seconds, changes = changed);
+                self.line(YELLOW, "■", &line);
+            }
+            (TurnOutcome::StoppedShort, Ok(_)) => {
+                let line = t!(
+                    "turn {turn} done · {tools} tools · {seconds}s{changes} · {stop_reason}",
+                    turn = turn, tools = tools, seconds = seconds, changes = changed, stop_reason = stop_reason,
+                );
+                self.line(GREEN, "✓", &line);
+            }
+            (TurnOutcome::Finished, Ok(_)) => {
+                let line = t!("turn {turn} done · {tools} tools · {seconds}s{changes}", turn = turn, tools = tools, seconds = seconds, changes = changed);
+                self.line(GREEN, "✓", &line);
+            }
+            (TurnOutcome::Failed, Ok(_)) => unreachable!("a turn fails only when its prompt request does"),
+        }
+    }
+
+    /// What a turn leaves open when it ends: its streamed text, pending
+    /// permissions, tool calls without a result, and prompts sent into it
+    /// and never taken in (they wait for the next turn).
+    fn close_turn_items(&mut self) {
+        self.finalize_text();
+        self.cancel_pending("turn ended");
+        self.close_open_tool_calls();
+        let unread: Vec<String> = self.steering.iter().map(|q| q.item_id.clone()).collect();
+        for id in unread.iter().rev() {
+            self.unsteer_to_queue(id, true);
+        }
+        debug_assert!(self.steering.is_empty() && self.pending.is_empty() && self.open_text.is_none());
+    }
+
+    /// The turn's `TurnEnd` item on the thread and its signed `turn` record.
+    fn record_turn_end(&mut self, outcome: TurnOutcome, stop_reason: &str, duration_ms: i64, changes: Option<TurnChanges>) {
         let mut turn_end = json!({
             "stop_reason": stop_reason,
             "tool_calls": self.turn_tool_calls,
@@ -1650,98 +1892,52 @@ impl<W: Write> Host<W> {
         if let Some(c) = &changes {
             turn_end["changes"] = serde_json::to_value(c).unwrap_or(Value::Null);
         }
-        if let Err(e) = self.push(ItemKind::TurnEnd, Some(status), None, turn_end) {
-            self.line(RED, "✖", &format!("store: {e}"));
+        if let Err(e) = self.push(ItemKind::TurnEnd, Some(outcome.item_status()), None, turn_end) {
+            self.store_failed(&e);
         }
         let summary = TurnSummary {
             ordinal: self.turn,
             user_text: self.turn_user_text.clone(),
-            assistant_text: self
-                .turn_assistant_text
-                .chars()
-                .take(ASSISTANT_HEAD)
-                .collect(),
+            assistant_text: self.turn_assistant_text.chars().take(ASSISTANT_HEAD_CHARS).collect(),
             tool_calls: self.turn_tool_calls,
             files_edited: self.turn_files_edited,
             duration_ms,
-            stop_reason: stop_reason.clone(),
+            stop_reason: stop_reason.to_string(),
             changes,
         };
-        if let Err(e) = self
-            .store
-            .record_turn(&self.signer, &self.cfg.session_id, &summary)
-        {
+        if let Err(e) = self.store.record_turn(&self.signer, &self.cfg.session_id, &summary) {
             self.line(RED, "✖", &format!("record_turn: {e}"));
         }
-        if let Err(e) = self.set_state(SessionState::Idle) {
-            self.line(RED, "✖", &format!("store: {e}"));
-        }
+    }
+
+    /// Tell the owner the turn ended: a desktop notification, and the
+    /// session's status.  `head` is the first line of the agent's answer.
+    fn announce_turn_end(&mut self, outcome: TurnOutcome, stop_reason: &str, head: &str) {
         let who = std::env::var("AXEL_AGENT_NAME").unwrap_or_else(|_| "agent".into());
-        let head: String = self.turn_assistant_text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect();
-        self.notify(&match stop_reason.as_str() {
-            "error" => format!("{who} hit an error"),
-            "cancelled" => format!("{who} stopped"),
-            _ if head.is_empty() => format!("{who} finished"),
-            _ => format!("{who} finished: {head}"),
+        self.notify(&match outcome {
+            TurnOutcome::Failed => t!("{who} hit an error", who = who),
+            TurnOutcome::Cancelled => t!("{who} stopped", who = who),
+            TurnOutcome::Finished | TurnOutcome::StoppedShort if head.is_empty() => t!("{who} finished", who = who),
+            TurnOutcome::Finished | TurnOutcome::StoppedShort => t!("{who} finished: {answer}", who = who, answer = head),
         });
         // Finished: a result the owner hasn't seen (done, which Rex marks until
         // they look); stopped by them: at rest (idle); failed: error.
-        let turn_state = match stop_reason.as_str() {
-            "error" => StatusState::Error,
-            "cancelled" => StatusState::Idle,
-            _ => StatusState::Done,
+        let turn_state = match outcome {
+            TurnOutcome::Failed => StatusState::Error,
+            TurnOutcome::Cancelled => StatusState::Idle,
+            TurnOutcome::Finished | TurnOutcome::StoppedShort => StatusState::Done,
         };
-        let _ = self.store.record_status(
+        if let Err(e) = self.store.record_status(
             &self.signer,
             &self.cfg.session_id,
             &StatusReport {
                 state: turn_state,
                 title: Some(format!("turn {} {}", self.turn, stop_reason)),
-                msg: (turn_state == StatusState::Done && !head.is_empty()).then(|| head.clone()),
+                msg: (turn_state == StatusState::Done && !head.is_empty()).then(|| head.to_string()),
                 ..Default::default()
             },
-        );
-        // Another agent's message started this turn: its answer goes back.
-        if stop_reason == "end_turn" {
-            self.return_answer();
-        }
-        // A finished turn is a result to look at (done); a cancelled one is at
-        // rest (idle); a failed one stopped (error).
-        let (osc_state, osc_msg) = match stop_reason.as_str() {
-            "error" => (axel_rex::osc::State::Error, "the turn failed".to_string()),
-            "cancelled" => (axel_rex::osc::State::Idle, String::new()),
-            _ => (axel_rex::osc::State::Done, head.clone()),
-        };
-        self.program_status(osc_state, None, &osc_msg);
-        let secs = duration_ms as f64 / 1000.0;
-        let tools = self.turn_tool_calls;
-        let turn = self.turn;
-        let changed = match summary.changes.as_ref().filter(|c| !c.files.is_empty()) {
-            Some(c) => {
-                let (a, r) = c.totals();
-                format!(" · {} file{} +{a} −{r}", c.files.len(), if c.files.len() == 1 { "" } else { "s" })
-            }
-            None => String::new(),
-        };
-        match (&res, status) {
-            (Ok(_), ItemStatus::Cancelled) => self.line(
-                YELLOW,
-                "■",
-                &format!("turn {turn} cancelled · {tools} tools · {secs:.1}s{changed}"),
-            ),
-            (Ok(_), _) => self.line(
-                GREEN,
-                "✓",
-                &format!(
-                    "turn {turn} done · {tools} tools · {secs:.1}s{changed}{}",
-                    if stop_reason == "end_turn" {
-                        String::new()
-                    } else {
-                        format!(" · {stop_reason}")
-                    }
-                ),
-            ),
-            (Err(e), _) => self.line(RED, "✖", &format!("turn {turn} failed: {e}")),
+        ) {
+            self.line(RED, "✖", &t!("status: {error}", error = e));
         }
     }
 
@@ -1756,168 +1952,14 @@ impl<W: Write> Host<W> {
                 self.append_text(ItemKind::Thought, &block_text(&chunk.content))
             }
             acp::SessionUpdate::UserMessageChunk(_) => Ok(()), // we pushed the UserMessage ourselves
-            acp::SessionUpdate::ToolCall(tc) => {
-                self.finalize_text();
-                let kind = ToolKind::parse(&enum_str(&tc.kind));
-                let status = tool_status(&enum_str(&tc.status));
-                let raw_input = tc.raw_input.clone().unwrap_or(Value::Null);
-                let summary = input_summary(&raw_input);
-                self.turn_tool_calls += 1;
-                if matches!(kind, ToolKind::Edit | ToolKind::Delete | ToolKind::Move) {
-                    self.turn_files_edited += 1;
-                    self.note_authored(&tc.locations, &raw_input);
-                }
-                let content = json!({
-                    "title": tc.title,
-                    "kind": kind.as_str(),
-                    "raw_input": truncate_json(&raw_input, RAW_LIMIT),
-                    "locations": locations_json(&tc.locations),
-                });
-                let ref_id = tc.tool_call_id.to_string();
-                if let Some(existing) = self.store.item_by_ref(&self.cfg.session_id, &ref_id)?
-                    && existing.turn == self.turn
-                {
-                    // A permission request may have created it first.
-                    self.store
-                        .update_item(&existing.id, Some(status), Some(content))?;
-                } else {
-                    self.push(ItemKind::ToolCall, Some(status), Some(ref_id), content)?;
-                }
-                self.line(
-                    YELLOW,
-                    "⚙",
-                    &format!(
-                        "{}{}",
-                        tc.title,
-                        if summary.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  {DIM}{summary}{RESET}")
-                        }
-                    ),
-                );
-                Ok(())
-            }
-            acp::SessionUpdate::ToolCallUpdate(upd) => {
-                let ref_id = upd.tool_call_id.to_string();
-                let f = &upd.fields;
-                let status = f.status.map(|s| tool_status(&enum_str(&s)));
-                let mut patch = serde_json::Map::new();
-                if let Some(t) = &f.title {
-                    patch.insert("title".into(), json!(t));
-                }
-                if let Some(k) = &f.kind {
-                    patch.insert("kind".into(), json!(ToolKind::parse(&enum_str(k)).as_str()));
-                }
-                if let Some(v) = &f.raw_input {
-                    patch.insert("raw_input".into(), truncate_json(v, RAW_LIMIT));
-                }
-                if let Some(v) = &f.raw_output {
-                    patch.insert("raw_output".into(), truncate_json(v, RAW_LIMIT));
-                }
-                if let Some(l) = &f.locations {
-                    patch.insert("locations".into(), locations_json(l));
-                    let edits = match &f.kind {
-                        Some(k) => matches!(ToolKind::parse(&enum_str(k)), ToolKind::Edit | ToolKind::Delete | ToolKind::Move),
-                        None => self
-                            .store
-                            .item_by_ref(&self.cfg.session_id, &ref_id)?
-                            .and_then(|it| it.content.get("kind").and_then(Value::as_str).map(|k| matches!(k, "edit" | "delete" | "move")))
-                            .unwrap_or(false),
-                    };
-                    if edits {
-                        self.note_authored(l, f.raw_input.as_ref().unwrap_or(&Value::Null));
-                    }
-                }
-                if let Some(c) = &f.content {
-                    let v = serde_json::to_value(c).unwrap_or(Value::Null);
-                    patch.insert("content".into(), truncate_json(&v, RAW_LIMIT));
-                }
-                let title = match self.store.item_by_ref(&self.cfg.session_id, &ref_id)? {
-                    Some(item) => {
-                        self.store
-                            .update_item(&item.id, status, Some(Value::Object(patch)))?;
-                        f.title
-                            .clone()
-                            .or_else(|| item_title(&item))
-                            .unwrap_or(ref_id)
-                    }
-                    None => {
-                        // An update for a call we never saw: materialise it.
-                        self.finalize_text();
-                        self.turn_tool_calls += 1;
-                        let title = f.title.clone().unwrap_or_else(|| ref_id.clone());
-                        patch.entry("title").or_insert(json!(title));
-                        patch
-                            .entry("kind")
-                            .or_insert(json!(ToolKind::Other.as_str()));
-                        self.push(
-                            ItemKind::ToolCall,
-                            Some(status.unwrap_or(ItemStatus::Running)),
-                            Some(ref_id),
-                            Value::Object(patch),
-                        )?;
-                        title
-                    }
-                };
-                match status {
-                    Some(ItemStatus::Completed) => self.line(GREEN, "✓", &title),
-                    Some(ItemStatus::Failed) => self.line(RED, "✗", &title),
-                    _ => {}
-                }
-                Ok(())
-            }
+            acp::SessionUpdate::ToolCall(tc) => self.on_tool_call(&tc),
+            acp::SessionUpdate::ToolCallUpdate(upd) => self.on_tool_call_update(&upd),
             acp::SessionUpdate::CurrentModeUpdate(m) => {
-                self.dim(&format!("· agent mode is now {}", m.current_mode_id));
+                self.dim(&t!("· agent mode is now {mode}", mode = m.current_mode_id));
                 Ok(())
             }
-            acp::SessionUpdate::Plan(plan) => {
-                self.finalize_text();
-                let mut lines = Vec::new();
-                for e in &plan.entries {
-                    let glyph = match enum_str(&e.status).as_str() {
-                        "completed" => "✓",
-                        "in_progress" => "▸",
-                        _ => "·",
-                    };
-                    lines.push(format!("{glyph} {}", e.content));
-                }
-                let text = lines.join("\n");
-                let content = json!({ "text": text, "plan": serde_json::to_value(&plan.entries).unwrap_or(Value::Null) });
-                match self.store.item_by_ref(&self.cfg.session_id, "plan")? {
-                    Some(item) => self.store.update_item(&item.id, None, Some(content))?,
-                    None => {
-                        self.push(
-                            ItemKind::Thought,
-                            Some(ItemStatus::Completed),
-                            Some("plan".into()),
-                            content,
-                        )?;
-                    }
-                }
-                self.line(BLUE, "☰", &format!("plan · {} steps", plan.entries.len()));
-                Ok(())
-            }
-            acp::SessionUpdate::UsageUpdate(u) => {
-                if u.size > 0 {
-                    self.store.set_session_context(&self.cfg.session_id, u.used, u.size)?;
-                }
-                if let Some(cost) = u.cost.filter(|c| c.currency.eq_ignore_ascii_case("USD") && c.amount.is_finite() && c.amount >= 0.0) {
-                    let amount = (cost.amount - self.session_cost).max(0.0);
-                    if amount > 0.0 {
-                        self.store.add_usage(&self.signer, &self.cfg.session_id, &axel_store::UsageDelta {
-                            cost_usd_est: amount,
-                            model: self.cfg.model.clone(),
-                            ..Default::default()
-                        }, None)?;
-                        self.session_cost += amount;
-                        self.turn_progress_cost += amount;
-                    }
-                    self.standard_cost_seen = true;
-                    self.turn_progress = true;
-                }
-                Ok(())
-            }
+            acp::SessionUpdate::Plan(plan) => self.on_plan(&plan),
+            acp::SessionUpdate::UsageUpdate(u) => self.on_usage_update(&u),
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()
@@ -1933,12 +1975,181 @@ impl<W: Write> Host<W> {
         }
     }
 
+    /// A new tool call: a `ToolCall` item (or the one a permission request
+    /// made for it first), counted in the turn, and a line in the pane.
+    fn on_tool_call(&mut self, tc: &acp::ToolCall) -> Result<()> {
+        self.finalize_text();
+        let kind = ToolKind::parse(&enum_str(&tc.kind));
+        let status = tool_status(tc.status);
+        let raw_input = tc.raw_input.clone().unwrap_or(Value::Null);
+        let summary = input_summary(&raw_input);
+        self.turn_tool_calls += 1;
+        if edits_files(kind) {
+            self.turn_files_edited += 1;
+            self.note_authored(&tc.locations, &raw_input);
+        }
+        let content = json!({
+            "title": tc.title,
+            "kind": kind.as_str(),
+            "raw_input": truncate_json(&raw_input, RAW_LIMIT_BYTES),
+            "locations": locations_json(&tc.locations),
+        });
+        let ref_id = tc.tool_call_id.to_string();
+        if let Some(existing) = self.store.item_by_ref(&self.cfg.session_id, &ref_id)?
+            && existing.turn == self.turn
+        {
+            // A permission request may have created it first.
+            self.store
+                .update_item(&existing.id, Some(status), Some(content))?;
+        } else {
+            self.push(ItemKind::ToolCall, Some(status), Some(ref_id), content)?;
+        }
+        let shown_summary = if summary.is_empty() { String::new() } else { format!("  {DIM}{summary}{RESET}") };
+        self.line(YELLOW, "⚙", &format!("{}{shown_summary}", tc.title));
+        Ok(())
+    }
+
+    /// An update to a tool call: merged into its item (made now if the call
+    /// was never seen), and its result shown when it has one.
+    fn on_tool_call_update(&mut self, upd: &acp::ToolCallUpdate) -> Result<()> {
+        let ref_id = upd.tool_call_id.to_string();
+        let f = &upd.fields;
+        let status = f.status.map(tool_status);
+        let mut patch = self.tool_call_patch(&ref_id, f)?;
+        let title = match self.store.item_by_ref(&self.cfg.session_id, &ref_id)? {
+            Some(item) => {
+                self.store
+                    .update_item(&item.id, status, Some(Value::Object(patch)))?;
+                f.title
+                    .clone()
+                    .or_else(|| item_title(&item))
+                    .unwrap_or(ref_id)
+            }
+            None => {
+                // An update for a call we never saw: materialise it.
+                self.finalize_text();
+                self.turn_tool_calls += 1;
+                let title = f.title.clone().unwrap_or_else(|| ref_id.clone());
+                patch.entry("title").or_insert(json!(title));
+                patch
+                    .entry("kind")
+                    .or_insert(json!(ToolKind::Other.as_str()));
+                self.push(
+                    ItemKind::ToolCall,
+                    Some(status.unwrap_or(ItemStatus::Running)),
+                    Some(ref_id),
+                    Value::Object(patch),
+                )?;
+                title
+            }
+        };
+        match status {
+            Some(ItemStatus::Completed) => self.line(GREEN, "✓", &title),
+            Some(ItemStatus::Failed) => self.line(RED, "✗", &title),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The fields a tool call update changes, as an item content patch.
+    /// Locations an edit names count as authored by the turn.
+    fn tool_call_patch(&mut self, ref_id: &str, f: &acp::ToolCallUpdateFields) -> Result<serde_json::Map<String, Value>> {
+        let mut patch = serde_json::Map::new();
+        if let Some(t) = &f.title {
+            patch.insert("title".into(), json!(t));
+        }
+        if let Some(k) = &f.kind {
+            patch.insert("kind".into(), json!(ToolKind::parse(&enum_str(k)).as_str()));
+        }
+        if let Some(v) = &f.raw_input {
+            patch.insert("raw_input".into(), truncate_json(v, RAW_LIMIT_BYTES));
+        }
+        if let Some(v) = &f.raw_output {
+            patch.insert("raw_output".into(), truncate_json(v, RAW_LIMIT_BYTES));
+        }
+        if let Some(l) = &f.locations {
+            patch.insert("locations".into(), locations_json(l));
+            let edits = match &f.kind {
+                Some(k) => edits_files(ToolKind::parse(&enum_str(k))),
+                None => self
+                    .store
+                    .item_by_ref(&self.cfg.session_id, ref_id)?
+                    .and_then(|it| it.content.get("kind").and_then(Value::as_str).map(|k| edits_files(ToolKind::parse(k))))
+                    .unwrap_or(false),
+            };
+            if edits {
+                self.note_authored(l, f.raw_input.as_ref().unwrap_or(&Value::Null));
+            }
+        }
+        if let Some(c) = &f.content {
+            let v = serde_json::to_value(c).unwrap_or(Value::Null);
+            patch.insert("content".into(), truncate_json(&v, RAW_LIMIT_BYTES));
+        }
+        Ok(patch)
+    }
+
+    /// The agent's plan: one `Thought` item, kept up to date.
+    fn on_plan(&mut self, plan: &acp::Plan) -> Result<()> {
+        self.finalize_text();
+        let text = plan
+            .entries
+            .iter()
+            .map(|e| {
+                let glyph = match e.status {
+                    acp::PlanEntryStatus::Completed => "✓",
+                    acp::PlanEntryStatus::InProgress => "▸",
+                    _ => "·",
+                };
+                format!("{glyph} {}", e.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = json!({ "text": text, "plan": serde_json::to_value(&plan.entries).unwrap_or(Value::Null) });
+        match self.store.item_by_ref(&self.cfg.session_id, "plan")? {
+            Some(item) => self.store.update_item(&item.id, None, Some(content))?,
+            None => {
+                self.push(
+                    ItemKind::Thought,
+                    Some(ItemStatus::Completed),
+                    Some("plan".into()),
+                    content,
+                )?;
+            }
+        }
+        self.line(BLUE, "☰", &t!("plan · {count} steps", count = plan.entries.len()));
+        Ok(())
+    }
+
+    /// How full the context is, and the session's running cost in USD,
+    /// when the harness reports them in ACP's own terms.
+    fn on_usage_update(&mut self, u: &acp::UsageUpdate) -> Result<()> {
+        if u.size > 0 {
+            self.store.set_session_context(&self.cfg.session_id, u.used, u.size)?;
+        }
+        if let Some(cost) = u.cost.as_ref().filter(|c| c.currency.eq_ignore_ascii_case("USD") && c.amount.is_finite() && c.amount >= 0.0) {
+            // A running total: only what it grew by is new.
+            let amount = (cost.amount - self.session_cost).max(0.0);
+            if amount > 0.0 {
+                self.store.add_usage(&self.signer, &self.cfg.session_id, &axel_store::UsageDelta {
+                    cost_usd_est: amount,
+                    model: self.cfg.model.clone(),
+                    ..Default::default()
+                }, None)?;
+                self.session_cost += amount;
+                self.turn_progress_cost += amount;
+            }
+            self.standard_cost_seen = true;
+            self.turn_progress = true;
+        }
+        Ok(())
+    }
+
     /// Append streamed text to the open AssistantMessage/Thought item, opening one if needed.
     fn append_text(&mut self, kind: ItemKind, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        if let Some(cur) = &self.cur_text
+        if let Some(cur) = &self.open_text
             && cur.kind != kind
         {
             self.finalize_text();
@@ -1946,7 +2157,7 @@ impl<W: Write> Host<W> {
         if kind == ItemKind::AssistantMessage {
             self.turn_assistant_text.push_str(text);
         }
-        match &mut self.cur_text {
+        match &mut self.open_text {
             Some(cur) => {
                 cur.text.push_str(text);
                 let (id, full) = (cur.id.clone(), cur.text.clone());
@@ -1960,13 +2171,13 @@ impl<W: Write> Host<W> {
                     None,
                     json!({ "text": text }),
                 )?;
-                self.cur_text = Some(TextItem {
+                self.open_text = Some(TextItem {
                     id: item.id,
                     kind,
                     text: text.to_string(),
                 });
                 if kind == ItemKind::Thought {
-                    self.dim("· thinking…");
+                    self.dim(t!("· thinking…"));
                 }
             }
         }
@@ -1975,12 +2186,12 @@ impl<W: Write> Host<W> {
 
     /// Close the open text item (marks it Completed and prints the prose head).
     fn finalize_text(&mut self) {
-        if let Some(cur) = self.cur_text.take() {
+        if let Some(cur) = self.open_text.take() {
             if let Err(e) = self
                 .store
                 .update_item(&cur.id, Some(ItemStatus::Completed), None)
             {
-                self.line(RED, "✖", &format!("store: {e}"));
+                self.store_failed(&e);
             }
             if cur.kind == ItemKind::AssistantMessage {
                 let shown = head(&cur.text, 160);
@@ -1997,9 +2208,49 @@ impl<W: Write> Host<W> {
         reply: oneshot::Sender<acp::RequestPermissionResponse>,
     ) -> Result<()> {
         self.finalize_text();
-        let ref_id = req.tool_call.tool_call_id.to_string();
-        let perm_ref = format!("permission:{ref_id}");
-        let f = &req.tool_call.fields;
+        let call = self.permission_call(&req.tool_call)?;
+        let options: Vec<(String, acp::PermissionOptionKind)> = req
+            .options
+            .iter()
+            .map(|o| (o.option_id.to_string(), o.kind))
+            .collect();
+        // A question for the owner (its choices are `answer:` options) is never
+        // a permission: no policy may pick an answer, whatever the mode.
+        let question = !req.options.is_empty() && req.options.iter().all(|o| o.option_id.to_string().starts_with(crate::claude::ANSWER_PREFIX));
+        if question {
+            let multiple = selection_bounds(&call.raw_input, &options)?;
+            return self.ask_owner(call, &req.options, options, multiple, true, reply);
+        }
+        match policy::decide(self.cfg.runtime_mode, call.kind, &call.title, &call.raw_input, &self.cfg.disallowed_tools) {
+            Decision::Allow => {
+                let picked = pick_option(&options, acp::PermissionOptionKind::AllowOnce, is_allow);
+                // The adapter may have withdrawn the request; nothing to undo.
+                let _ = reply.send(selected_or_cancelled(picked));
+                self.line(GREEN, "✓", &t!("allow: {tool}", tool = call.label()));
+            }
+            Decision::Deny { reason } => {
+                let picked = pick_option(&options, acp::PermissionOptionKind::RejectOnce, is_reject);
+                // The adapter may have withdrawn the request; nothing to undo.
+                let _ = reply.send(selected_or_cancelled(picked));
+                self.push(
+                    ItemKind::Permission,
+                    Some(ItemStatus::Denied),
+                    Some(call.permission_ref()),
+                    json!({ "title": call.title, "kind": call.kind.as_str(), "raw_input": truncate_json(&call.raw_input, RAW_LIMIT_BYTES), "reason": reason, "decided_by": "policy" }),
+                )?;
+                let reason = format!("{DIM}({reason}){RESET}");
+                self.line(RED, "✗", &t!("deny: {tool} {reason}", tool = call.label(), reason = reason));
+            }
+            Decision::Ask => self.ask_owner(call, &req.options, options, None, false, reply)?,
+        }
+        Ok(())
+    }
+
+    /// What a permission request is about: its tool call's title, kind and
+    /// input, from the request, else from the tool call item already stored.
+    fn permission_call(&self, tool_call: &acp::ToolCallUpdate) -> Result<PermissionCall> {
+        let ref_id = tool_call.tool_call_id.to_string();
+        let f = &tool_call.fields;
         let existing = self.store.item_by_ref(&self.cfg.session_id, &ref_id)?;
         let title = f
             .title
@@ -2009,149 +2260,63 @@ impl<W: Write> Host<W> {
         let kind = f
             .kind
             .map(|k| ToolKind::parse(&enum_str(&k)))
-            .or_else(|| {
-                existing.as_ref().and_then(|i| {
-                    i.content
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .map(ToolKind::parse)
-                })
-            })
+            .or_else(|| existing.as_ref().and_then(|i| i.content.get("kind").and_then(Value::as_str).map(ToolKind::parse)))
             .unwrap_or_default();
         let raw_input = f
             .raw_input
             .clone()
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|i| i.content.get("raw_input").cloned())
-            })
+            .or_else(|| existing.as_ref().and_then(|i| i.content.get("raw_input").cloned()))
             .unwrap_or(Value::Null);
-        let options: Vec<(String, String)> = req
-            .options
-            .iter()
-            .map(|o| (o.option_id.to_string(), enum_str(&o.kind)))
-            .collect();
-        let pick = |prefix: &str, prefer: &str| -> Option<String> {
-            options
-                .iter()
-                .find(|(_, k)| k == prefer)
-                .or_else(|| options.iter().find(|(_, k)| k.starts_with(prefix)))
-                .map(|(id, _)| id.clone())
-        };
-        let summary = input_summary(&raw_input);
-        let label = if summary.is_empty() {
-            title.clone()
-        } else {
-            format!("{title}  {DIM}{summary}{RESET}")
-        };
+        Ok(PermissionCall { ref_id, title, kind, raw_input })
+    }
 
-        // A question for the owner (its choices are `answer:` options) is never
-        // a permission: no policy may pick an answer, whatever the mode.
-        let question = !req.options.is_empty() && req.options.iter().all(|o| o.option_id.to_string().starts_with(crate::claude::ANSWER_PREFIX));
-        let multiple = if question && raw_input.get("multiSelect").and_then(Value::as_bool)==Some(true) {
-            let count=options.iter().filter(|(_,k)|k.starts_with("allow")).count();
-            let min=raw_input.get("minSelections").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let max=raw_input.get("maxSelections").and_then(Value::as_u64).map(|n|n as usize).unwrap_or(count);
-            anyhow::ensure!(min<=max && max<=count,"invalid question selection bounds");
-            Some((min,max))
-        } else {None};
-        let decision = if question {
-            Decision::Ask
+    /// Park a permission request (or a question) for the owner: a pending
+    /// item on the thread, the session blocked, and a notification.
+    fn ask_owner(
+        &mut self,
+        call: PermissionCall,
+        offered: &[acp::PermissionOption],
+        options: Vec<(String, acp::PermissionOptionKind)>,
+        multiple: Option<(usize, usize)>,
+        question: bool,
+        reply: oneshot::Sender<acp::RequestPermissionResponse>,
+    ) -> Result<()> {
+        debug_assert!(question || multiple.is_none(), "only a question has several selections");
+        let opts: Vec<Value> = offered
+            .iter()
+            .map(|o| json!({ "option_id": o.option_id.to_string(), "name": o.name, "kind": enum_str(&o.kind) }))
+            .collect();
+        let item = self.push(
+            if question { ItemKind::Question } else { ItemKind::Permission },
+            Some(ItemStatus::Pending),
+            Some(call.permission_ref()),
+            json!({ "title": call.title, "kind": call.kind.as_str(), "raw_input": truncate_json(&call.raw_input, RAW_LIMIT_BYTES), "options": opts, "multi_select": multiple.map(|(min,max)|json!({"min":min,"max":max})) }),
+        )?;
+        let who = std::env::var("AXEL_AGENT_NAME").unwrap_or_else(|_| "agent".into());
+        let title = &call.title;
+        self.notify(&if question { t!("{who} asks: {title}", who = who, title = title) } else { t!("{who} needs permission: {title}", who = who, title = title) });
+        self.set_state(SessionState::Blocked)?;
+        let (osc_kind, blocked_kind) = if question {
+            (axel_rex::osc::Kind::Question, BlockedKind::Question)
         } else {
-            policy::decide(self.cfg.runtime_mode, kind, &title, &raw_input, &self.cfg.disallowed_tools)
+            (axel_rex::osc::Kind::Permission, BlockedKind::Permission)
         };
-        match decision {
-            Decision::Allow => {
-                let resp = match pick("allow", "allow_once") {
-                    Some(id) => acp::RequestPermissionResponse::new(
-                        acp::RequestPermissionOutcome::Selected(
-                            acp::SelectedPermissionOutcome::new(acp::PermissionOptionId::new(id)),
-                        ),
-                    ),
-                    None => acp::RequestPermissionResponse::new(
-                        acp::RequestPermissionOutcome::Cancelled,
-                    ),
-                };
-                let _ = reply.send(resp);
-                self.line(GREEN, "✓", &format!("allow: {label}"));
-            }
-            Decision::Deny { reason } => {
-                let resp = match pick("reject", "reject_once") {
-                    Some(id) => acp::RequestPermissionResponse::new(
-                        acp::RequestPermissionOutcome::Selected(
-                            acp::SelectedPermissionOutcome::new(acp::PermissionOptionId::new(id)),
-                        ),
-                    ),
-                    None => acp::RequestPermissionResponse::new(
-                        acp::RequestPermissionOutcome::Cancelled,
-                    ),
-                };
-                let _ = reply.send(resp);
-                self.push(
-                    ItemKind::Permission,
-                    Some(ItemStatus::Denied),
-                    Some(perm_ref),
-                    json!({ "title": title, "kind": kind.as_str(), "raw_input": truncate_json(&raw_input, RAW_LIMIT), "reason": reason, "decided_by": "policy" }),
-                )?;
-                self.line(RED, "✗", &format!("deny: {label} {DIM}({reason}){RESET}"));
-            }
-            Decision::Ask => {
-                let opts: Vec<Value> = req
-                    .options
-                    .iter()
-                    .map(|o| json!({ "option_id": o.option_id.to_string(), "name": o.name, "kind": enum_str(&o.kind) }))
-                    .collect();
-                let item = self.push(
-                    if question { ItemKind::Question } else { ItemKind::Permission },
-                    Some(ItemStatus::Pending),
-                    Some(perm_ref),
-                    json!({ "title": title, "kind": kind.as_str(), "raw_input": truncate_json(&raw_input, RAW_LIMIT), "options": opts, "multi_select": multiple.map(|(min,max)|json!({"min":min,"max":max})) }),
-                )?;
-                let who = std::env::var("AXEL_AGENT_NAME").unwrap_or_else(|_| "agent".into());
-                self.notify(&if question { format!("{who} asks: {title}") } else { format!("{who} needs permission: {title}") });
-                                self.state = SessionState::Blocked;
-                self.store.update_session(
-                    &self.signer,
-                    &self.cfg.session_id,
-                    &SessionUpdate {
-                        state: Some(SessionState::Blocked),
-                        ..Default::default()
-                    },
-                )?;
-                let (osc_kind, blocked_kind) = if question {
-                    (axel_rex::osc::Kind::Question, BlockedKind::Question)
-                } else {
-                    (axel_rex::osc::Kind::Permission, BlockedKind::Permission)
-                };
-                self.program_status(axel_rex::osc::State::Blocked, Some(osc_kind), &title);
-                self.store.record_status(
-                    &self.signer,
-                    &self.cfg.session_id,
-                    &StatusReport {
-                        state: StatusState::Blocked,
-                        kind: Some(blocked_kind),
-                        title: Some(title.clone()),
-                        msg: if summary.is_empty() {
-                            None
-                        } else {
-                            Some(summary.clone())
-                        },
-                        progress: None,
-                    },
-                )?;
-                self.pending.insert(
-                    item.id,
-                    PendingPermission {
-                        reply,
-                        title,
-                        options,
-                        multiple,
-                    },
-                );
-                self.line(MAGENTA, "?", &format!("permission: {label}"));
-            }
-        }
+        self.program_status(axel_rex::osc::State::Blocked, Some(osc_kind), title);
+        let summary = input_summary(&call.raw_input);
+        self.store.record_status(
+            &self.signer,
+            &self.cfg.session_id,
+            &StatusReport {
+                state: StatusState::Blocked,
+                kind: Some(blocked_kind),
+                title: Some(title.clone()),
+                msg: (!summary.is_empty()).then_some(summary),
+                progress: None,
+            },
+        )?;
+        let label = call.label();
+        self.pending.insert(item.id, PendingPermission { reply, title: call.title, options, multiple });
+        self.line(MAGENTA, "?", &t!("permission: {tool}", tool = label));
         Ok(())
     }
 
@@ -2161,6 +2326,7 @@ impl<W: Write> Host<W> {
         };
         let allowed = validate_answer(&p.options,p.multiple,option_id)?;
         let p = self.pending.remove(item_id).expect("checked above");
+        // The adapter may have withdrawn the request; the item still records the answer.
         let _ = p.reply.send(acp::RequestPermissionResponse::new(
             acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
                 acp::PermissionOptionId::new(option_id.to_string()),
@@ -2188,12 +2354,11 @@ impl<W: Write> Host<W> {
                 },
             )?;
         }
-        let (colour, glyph, verb) = if allowed {
-            (GREEN, "✓", "allowed")
+        if allowed {
+            self.line(GREEN, "✓", &t!("allowed: {tool}", tool = p.title));
         } else {
-            (RED, "✗", "denied")
-        };
-        self.line(colour, glyph, &format!("{verb}: {}", p.title));
+            self.line(RED, "✗", &t!("denied: {tool}", tool = p.title));
+        }
         Ok(())
     }
 
@@ -2204,7 +2369,7 @@ impl<W: Write> Host<W> {
     fn close_open_tool_calls(&mut self) {
         let open = match self.store.open_tool_calls(&self.cfg.session_id, self.turn) {
             Ok(open) => open,
-            Err(e) => return self.line(RED, "✖", &format!("store: {e}")),
+            Err(e) => return self.store_failed(&e),
         };
         for item in open {
             if let Err(e) = self.store.update_item(
@@ -2212,7 +2377,7 @@ impl<W: Write> Host<W> {
                 Some(ItemStatus::Cancelled),
                 Some(json!({ "reason": "the turn ended before it finished" })),
             ) {
-                self.line(RED, "✖", &format!("store: {e}"));
+                self.store_failed(&e);
             }
         }
     }
@@ -2223,6 +2388,7 @@ impl<W: Write> Host<W> {
         }
         let pending = std::mem::take(&mut self.pending);
         for (item_id, p) in pending {
+            // The adapter may have withdrawn the request already.
             let _ = p.reply.send(acp::RequestPermissionResponse::new(
                 acp::RequestPermissionOutcome::Cancelled,
             ));
@@ -2231,13 +2397,11 @@ impl<W: Write> Host<W> {
                 Some(ItemStatus::Cancelled),
                 Some(json!({ "reason": why })),
             ) {
-                self.line(RED, "✖", &format!("store: {e}"));
+                self.store_failed(&e);
             }
-            self.line(
-                YELLOW,
-                "■",
-                &format!("permission cancelled: {} {DIM}({why}){RESET}", p.title),
-            );
+            // `why` is stored as it is (an end reason, in English); the pane frames it.
+            let reason = format!("{DIM}({why}){RESET}");
+            self.line(YELLOW, "■", &t!("permission cancelled: {tool} {reason}", tool = p.title, reason = reason));
         }
     }
 
@@ -2258,20 +2422,14 @@ impl<W: Write> Host<W> {
         let snap = match checkpoint::capture(&self.cfg.cwd, &name, checkpoint::BUDGET, same_as) {
             Ok(s) => s,
             Err(e) => {
-                self.line(YELLOW, "!", &format!("turn {} checkpoint skipped: {e:#}", self.turn));
+                self.line(YELLOW, "!", &t!("turn {turn} checkpoint skipped: {error}", turn = self.turn, error = format!("{e:#}")));
                 return None;
             }
         };
         if started.elapsed() > checkpoint::SLOW && !self.checkpoint_slow_told {
             self.checkpoint_slow_told = true;
-            self.line(
-                YELLOW,
-                "!",
-                &format!(
-                    "checkpoint took {:.1}s: a large file that isn't ignored? add it to .gitignore",
-                    started.elapsed().as_secs_f64()
-                ),
-            );
+            let seconds = format!("{:.1}", started.elapsed().as_secs_f64());
+            self.line(YELLOW, "!", &t!("checkpoint took {seconds}s: a large file that isn't ignored? add it to .gitignore", seconds = seconds));
         }
         snap
     }
@@ -2286,7 +2444,7 @@ impl<W: Write> Host<W> {
         let mut c = match checkpoint::changes(&self.cfg.cwd, &before, &after, &self.turn_authored) {
             Ok(c) => c,
             Err(e) => {
-                self.line(YELLOW, "!", &format!("turn {} changes unknown: {e:#}", self.turn));
+                self.line(YELLOW, "!", &t!("turn {turn} changes unknown: {error}", turn = self.turn, error = format!("{e:#}")));
                 return None;
             }
         };
@@ -2359,11 +2517,11 @@ impl<W: Write> Host<W> {
                 .store
                 .update_item(&q.item_id, Some(ItemStatus::Cancelled), None)
             {
-                self.line(RED, "✖", &format!("store: {e}"));
+                self.store_failed(&e);
             }
         }
         if let Err(e) = self.store.set_session_socket(&self.cfg.session_id, None) {
-            self.line(RED, "✖", &format!("store: {e}"));
+            self.store_failed(&e);
         }
         if let Err(e) = self
             .store
@@ -2372,52 +2530,79 @@ impl<W: Write> Host<W> {
             self.line(RED, "✖", &format!("end_session: {e}"));
         }
         self.state = SessionState::Ended;
-        self.line(CYAN, "○", &format!("session ended: {reason}"));
+        self.line(CYAN, "○", &t!("session ended: {reason}", reason = reason));
     }
 }
 
 // --- socket server -------------------------------------------------------------
 
+/// After a failed `accept` (out of file descriptors, say), wait this long
+/// before the next: the retries go on until the host aborts the task, at a
+/// rate that can't spin a core.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The longest command line a client may send.  Commands carry a prompt's
+/// text and attachment paths, never file contents: 16 MiB is far more than
+/// anyone types or pastes, and one line can't take all memory.
+const COMMAND_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Connections served at once.  Clients (`axel send`, the thread view) send
+/// one command per connection and hang up; more than this at once is a
+/// runaway script, which then waits for a turn instead of piling up tasks.
+const CONNECTIONS_MAX: usize = 64;
+
 async fn serve_socket(listener: UnixListener, tx: mpsc::UnboundedSender<Event>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS_MAX));
     loop {
+        let slot = Arc::clone(&slots).acquire_owned().await.expect("the semaphore is never closed");
         let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
             continue;
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let (r, mut w) = stream.into_split();
-            let mut lines = BufReader::new(r).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            serve_connection(stream, tx).await;
+            drop(slot);
+        });
+    }
+}
+
+/// One client: a reply line for every command line, until it hangs up.
+async fn serve_connection(stream: tokio::net::UnixStream, tx: mpsc::UnboundedSender<Event>) {
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    while let Ok(Some(read)) = transport::read_line_bounded(&mut reader, COMMAND_LIMIT_BYTES).await {
+        let reply = match read {
+            LineRead::Line(bytes) => {
+                let line = String::from_utf8_lossy(&bytes);
                 if line.trim().is_empty() {
                     continue;
                 }
-                let reply = match serde_json::from_str::<Command>(&line) {
-                    Err(e) => Reply::Error {
-                        message: format!("bad command: {e}"),
-                    },
-                    Ok(cmd) => {
-                        let (rtx, rrx) = oneshot::channel();
-                        if tx.send(Event::Command { cmd, reply: rtx }).is_err() {
-                            Reply::Error {
-                                message: "host is shutting down".into(),
-                            }
-                        } else {
-                            rrx.await.unwrap_or(Reply::Error {
-                                message: "host dropped the command".into(),
-                            })
-                        }
-                    }
-                };
-                let mut s =
-                    serde_json::to_string(&reply).unwrap_or_else(|_| r#"{"reply":"ok"}"#.into());
-                s.push('\n');
-                if w.write_all(s.as_bytes()).await.is_err() {
-                    break;
-                }
+                command_reply(&line, &tx).await
             }
-        });
+            LineRead::TooLong { length_bytes } => Reply::Error {
+                message: format!("command too long: {length_bytes} bytes, over the {COMMAND_LIMIT_BYTES}-byte limit"),
+            },
+        };
+        let mut s = serde_json::to_string(&reply).expect("a Reply has only strings and numbers: it always serializes");
+        s.push('\n');
+        if w.write_all(s.as_bytes()).await.is_err() {
+            break;
+        }
     }
+}
+
+/// Hand one command line to the host's loop and wait for its reply.
+async fn command_reply(line: &str, tx: &mpsc::UnboundedSender<Event>) -> Reply {
+    let cmd = match serde_json::from_str::<Command>(line) {
+        Ok(cmd) => cmd,
+        Err(e) => return Reply::Error { message: format!("bad command: {e}") },
+    };
+    let (rtx, rrx) = oneshot::channel();
+    if tx.send(Event::Command { cmd, reply: rtx }).is_err() {
+        return Reply::Error { message: "host is shutting down".into() };
+    }
+    rrx.await.unwrap_or(Reply::Error { message: "host dropped the command".into() })
 }
 
 // --- fs client methods ---------------------------------------------------------
@@ -2430,12 +2615,26 @@ fn resolve(cwd: &Path, p: &Path) -> PathBuf {
     }
 }
 
+/// The largest file an agent may read through `fs/read_text_file`.  Source
+/// files are kilobytes and logs megabytes; past 64 MiB it isn't text an
+/// agent can read in one go, and reading it would hold it all in memory.
+const FS_READ_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
 async fn fs_read(
     cwd: &Path,
     req: acp::ReadTextFileRequest,
     responder: Responder<acp::ReadTextFileResponse>,
 ) -> Result<(), acp::Error> {
     let path = resolve(cwd, &req.path);
+    // Refused before it is read: the whole file is held to slice its lines.
+    if let Ok(meta) = tokio::fs::metadata(&path).await
+        && meta.len() > FS_READ_LIMIT_BYTES
+    {
+        return responder.respond_with_error(acp::Error::invalid_params().data(json!({
+            "path": path.display().to_string(),
+            "error": format!("file is {} bytes, over the {FS_READ_LIMIT_BYTES}-byte limit for a text read", meta.len()),
+        })));
+    }
     match tokio::fs::read_to_string(&path).await {
         Ok(text) => {
             let content = slice_lines(&text, req.line, req.limit);
@@ -2482,8 +2681,9 @@ fn slice_lines(text: &str, line: Option<u32>, limit: Option<u32>) -> String {
     if line.is_none() && limit.is_none() {
         return text.to_string();
     }
-    let skip = line.map(|l| l.saturating_sub(1) as usize).unwrap_or(0);
-    let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
+    let as_count = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+    let skip = line.map_or(0, |l| as_count(l.saturating_sub(1)));
+    let take = limit.map_or(usize::MAX, as_count);
     let mut out: String = text
         .lines()
         .skip(skip)
@@ -2507,12 +2707,18 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
     }
 }
 
-fn tool_status(s: &str) -> ItemStatus {
-    match s {
-        "completed" => ItemStatus::Completed,
-        "failed" => ItemStatus::Failed,
+fn tool_status(status: acp::ToolCallStatus) -> ItemStatus {
+    match status {
+        acp::ToolCallStatus::Completed => ItemStatus::Completed,
+        acp::ToolCallStatus::Failed => ItemStatus::Failed,
+        // Pending, in progress, and kinds a newer protocol adds.
         _ => ItemStatus::Running,
     }
+}
+
+/// Kinds of tool that change files: their calls count as the turn's edits.
+fn edits_files(kind: ToolKind) -> bool {
+    matches!(kind, ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
 }
 
 fn block_text(b: &acp::ContentBlock) -> String {
@@ -2541,20 +2747,22 @@ fn item_title(item: &ConversationItem) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Keep `v` if it serialises within `limit` bytes; otherwise its serialised head as a string.
-/// `v`, cut to about `limit` bytes. Text stays text: a string, or text
-/// blocks (`[{type: text, text}]`), is cut as text and stays readable; only
-/// other JSON is cut as its serialization (stored as a string).
-fn truncate_json(v: &Value, limit: usize) -> Value {
-    if v.to_string().len() <= limit {
+/// `v`, cut to about `limit_bytes`: kept whole when its serialization fits.
+/// Text stays text: a string, or text blocks (`[{type: text, text}]`), is
+/// cut as text and stays readable; only other JSON is cut as its
+/// serialization (stored as a string).
+fn truncate_json(v: &Value, limit_bytes: usize) -> Value {
+    if v.to_string().len() <= limit_bytes {
         return v.clone();
     }
     let cut = |s: &str| {
-        let mut end = limit.min(s.len());
+        let mut end = limit_bytes.min(s.len());
         while !s.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}…", &s[..end])
+        let out = format!("{}…", &s[..end]);
+        debug_assert!(out.len() <= limit_bytes + '…'.len_utf8());
+        out
     };
     match v {
         Value::String(s) => Value::String(cut(s)),
@@ -2566,11 +2774,12 @@ fn truncate_json(v: &Value, limit: usize) -> Value {
     }
 }
 
-/// First line of `s`, at most `n` chars.
-fn head(s: &str, n: usize) -> String {
+/// First line of `s`, at most `max_chars` chars, with an ellipsis when
+/// anything was left out.
+fn head(s: &str, max_chars: usize) -> String {
     let first = s.lines().next().unwrap_or("");
-    let mut out: String = first.chars().take(n).collect();
-    if first.chars().count() > n || s.lines().count() > 1 {
+    let mut out: String = first.chars().take(max_chars).collect();
+    if first.chars().count() > max_chars || s.lines().count() > 1 {
         out.push('…');
     }
     out
@@ -2623,11 +2832,15 @@ fn usage_delta(u: &TurnUsage) -> axel_store::UsageDelta {
 fn setup_failure_message(harness: &Harness, err: &str) -> String {
     let lower = err.to_ascii_lowercase();
     if lower.contains("authentication required") || lower.contains("auth_required") || lower.contains("not logged in") {
-        return format!("{} isn't logged in, so the agent couldn't start. To log in, {}; then send your message again.", harness.label(), harness.login());
+        // `login` is the store's English instruction (a command to run).
+        return t!(
+            "{harness} isn't logged in, so the agent couldn't start. To log in, {login}; then send your message again.",
+            harness = harness.label(), login = harness.login(),
+        );
     }
     let first = err.lines().next().unwrap_or(err).trim();
     let first: String = if first.chars().count() > 300 { format!("{}…", first.chars().take(300).collect::<String>()) } else { first.to_string() };
-    format!("{} couldn't start: {first}", harness.label())
+    t!("{harness} couldn't start: {reason}", harness = harness.label(), reason = first)
 }
 
 #[cfg(test)]
@@ -2636,7 +2849,7 @@ mod tests {
 
     #[test]
     fn composite_answers_are_bounded_unique_and_never_permission_grants() {
-        let options=vec![("answer:0".into(),"allow_once".into()),("answer:1".into(),"allow_once".into()),("answer:none".into(),"reject_once".into())];
+        let options=vec![("answer:0".into(),acp::PermissionOptionKind::AllowOnce),("answer:1".into(),acp::PermissionOptionKind::AllowOnce),("answer:none".into(),acp::PermissionOptionKind::RejectOnce)];
         let both=r#"answer:multi:["answer:0","answer:1"]"#;
         assert!(validate_answer(&options,Some((1,2)),both).unwrap());
         assert!(validate_answer(&options,None,both).is_err());

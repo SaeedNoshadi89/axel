@@ -12,8 +12,13 @@ use rusqlite::{OptionalExtension, params};
 use crate::wire::{self, kind, tag};
 use crate::{TurnMark, 
     Error, Harness, LimitWindow, NewSession, ParticipantRole, Relationship, Session, SessionUpdate, StatusReport, Store,
-    Thread, ThreadState, ThreadWorkspace, TurnSummary, Usage, UsageDelta, new_id, now,
+    Thread, ThreadState, ThreadWorkspace, TurnSummary, Usage, UsageDelta, new_id, now, sql_integer,
 };
+
+/// The most characters of assistant prose a shared turn carries: enough for
+/// the head of a reply, and it keeps a kind-40 envelope a few kilobytes
+/// (the bound `TurnSummary::assistant_text` documents).
+const ASSISTANT_TEXT_CHARS_MAX: usize = 2000;
 
 fn tag2(a: &str, b: &str) -> Vec<String> {
     vec![a.to_string(), b.to_string()]
@@ -31,7 +36,9 @@ impl Store {
             )
             .optional()?
             .flatten();
-        Ok(now().max(last.map_or(0, |l| l + 1)) as u64)
+        let next = now().max(last.map_or(0, |l| l.saturating_add(1)));
+        debug_assert!(last.is_none_or(|l| next > l || l == i64::MAX));
+        u64::try_from(next).map_err(|_| Error::Corrupt(format!("clock before 1970: {next}")))
     }
 
     /// The owner attestation registered for `signer`, if it is one of our agents.
@@ -172,7 +179,7 @@ impl Store {
     ) -> Result<(), Error> {
         self.require_thread(thread_id)?;
         let op = wire::ThreadProjectOp {
-            op: "attach".into(),
+            op: wire::ProjectAction::Attach,
             repo_key: repo_key.map(str::to_string),
             path_hint: Some(path_hint.to_string_lossy().into_owned()),
             workspace_kind: Some(ws.kind),
@@ -201,7 +208,7 @@ impl Store {
     ) -> Result<(), Error> {
         self.require_thread(thread_id)?;
         let op = wire::ThreadProjectOp {
-            op: "detach".into(),
+            op: wire::ProjectAction::Detach,
             repo_key: Some(repo_key_or_path.to_string()),
             path_hint: Some(repo_key_or_path.to_string()),
             ..Default::default()
@@ -226,7 +233,7 @@ impl Store {
     ) -> Result<(), Error> {
         self.require_thread(thread_id)?;
         let content = serde_json::to_string(&wire::ParticipantOp {
-            op: "add".into(),
+            op: wire::ParticipantAction::Add,
             role: Some(role),
         })?;
         let env = self.build(
@@ -248,7 +255,7 @@ impl Store {
     ) -> Result<(), Error> {
         self.require_thread(thread_id)?;
         let content = serde_json::to_string(&wire::ParticipantOp {
-            op: "remove".into(),
+            op: wire::ParticipantAction::Remove,
             role: None,
         })?;
         let env = self.build(
@@ -392,7 +399,7 @@ impl Store {
         self.conn.execute(
             "INSERT INTO session_context (session_id, used, size, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (session_id) DO UPDATE SET used = excluded.used, size = excluded.size, updated_at = excluded.updated_at",
-            params![session_id, used as i64, size as i64, now()],
+            params![session_id, sql_integer(used, "context tokens used")?, sql_integer(size, "context window size")?, now()],
         )?;
         Ok(())
     }
@@ -408,7 +415,7 @@ impl Store {
             params![
                 m.session_id,
                 m.ordinal,
-                m.open as i64,
+                i64::from(m.open),
                 m.before_commit,
                 m.before_tree,
                 m.last_after_tree,
@@ -434,7 +441,7 @@ impl Store {
 
     /// Share a completed turn of a managed session (kind 40).  Only the
     /// summary travels; conversation items stay on this machine.  The
-    /// assistant text is cut to 2000 characters.
+    /// assistant text is cut to 2000 characters (`ASSISTANT_TEXT_CHARS_MAX`).
     pub fn record_turn(
         &self,
         signer: &Keypair,
@@ -443,8 +450,8 @@ impl Store {
     ) -> Result<(), Error> {
         let session = self.require_session(session_id)?;
         let mut summary = t.clone();
-        if summary.assistant_text.chars().count() > 2000 {
-            summary.assistant_text = summary.assistant_text.chars().take(2000).collect();
+        if summary.assistant_text.chars().count() > ASSISTANT_TEXT_CHARS_MAX {
+            summary.assistant_text = summary.assistant_text.chars().take(ASSISTANT_TEXT_CHARS_MAX).collect();
         }
         let env = self.build(
             signer,
@@ -479,7 +486,7 @@ impl Store {
     pub fn set_transcript_offset(&self, session_id: &str, offset: u64) -> Result<(), Error> {
         let n = self.conn.execute(
             "UPDATE sessions SET transcript_offset = ?2 WHERE id = ?1",
-            params![session_id, offset as i64],
+            params![session_id, sql_integer(offset, "transcript offset")?],
         )?;
         if n == 0 {
             return Err(Error::NotFound(format!("session {session_id}")));
